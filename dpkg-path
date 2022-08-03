@@ -1,8 +1,9 @@
 #!/bin/sh
+path=$(echo $1 | sed 's:/*$::')
 for pkg in $(dpkg --get-selections | awk '$2=="install" {print $1}')
 do
-  f=$(dpkg -L $pkg | grep $1)
-  if [ -n "$f" ]
+  installed=$(dpkg -L $pkg | grep -w $path)
+  if [ -n "$installed" ]
   then
     echo -n $pkg" "
   fi
