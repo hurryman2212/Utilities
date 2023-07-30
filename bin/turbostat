@@ -1,0 +1,2 @@
+#!/bin/sh
+/usr/src/linux-headers-$(uname -r)/tools/power/x86/turbostat/turbostat "$@"
