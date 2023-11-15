@@ -1,2 +1,7 @@
 #!/bin/sh
-/usr/src/linux-headers-$(uname -r)/tools/power/x86/turbostat/turbostat "$@"
+ZEN_PATH=/usr/src/linux-headers-$(uname -r)/tools/power/x86/turbostat/turbostat
+if [ -f "$ZEN_PATH" ]; then
+    $ZEN_PATH "$@"
+else
+    turbostat "$@"
+fi

@@ -1,2 +1,7 @@
 #!/bin/sh
-/usr/src/linux-headers-$(uname -r)/tools/perf/perf "$@"
+ZEN_PATH=/usr/src/linux-headers-$(uname -r)/tools/perf/perf
+if [ -f "$ZEN_PATH" ]; then
+    $ZEN_PATH "$@"
+else
+    perf "$@"
+fi
