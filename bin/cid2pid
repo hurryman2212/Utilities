@@ -1,0 +1,9 @@
+#!/bin/sh
+CID=$1
+PID=$(ps aux | grep "[\"]guest-cid\":$CID" | awk '{print $2}')
+if [ "$PID" ]; then
+    echo "$PID"
+    exit 0
+else
+    exit 1
+fi
