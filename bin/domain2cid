@@ -1,0 +1,15 @@
+#!/bin/sh
+VM=$1
+PID=$(ps aux | grep "[g]uest=$VM" | awk '{print $2}')
+if [ -z "$PID" ]; then
+	exit 1
+fi
+
+CMDLINE=$(tr '\0' ' ' <"/proc/$PID/cmdline")
+CID=$(printf '%s\n' "$CMDLINE" | sed -n 's/.*"guest-cid":\([0-9]\+\).*/\1/p')
+if [ "$CID" ]; then
+	echo "$CID"
+	exit 0
+else
+	exit 1
+fi

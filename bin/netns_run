@@ -1,0 +1,144 @@
+#!/bin/bash
+SCRIPT_DIRPATH=$(dirname "${BASH_SOURCE[0]}")
+
+# Array to store PIDs of the background processes
+declare -a pids
+
+# should_revert_ip_forward=0
+# should_revert_iptables_nat=0
+
+# Function to check and save original state of IP forwarding
+check_ip_forward() {
+	original_ip_forward=$(sysctl -n net.ipv4.ip_forward)
+	if [ "$original_ip_forward" -eq 0 ]; then
+		# Enable IP forwarding if it was disabled
+		sysctl -w net.ipv4.ip_forward=1 >/dev/null
+		# (can we restore it safely after ALL instances of `netns_run` are terminated?)
+		#should_revert_ip_forward=1
+		#else
+		#should_revert_ip_forward=0
+	fi
+}
+
+# Function to check and save original iptables NAT rule
+check_iptables_nat() {
+	if ! iptables -t nat -C POSTROUTING -s 10.0.0.0/8 -o "$net_dev" -j MASQUERADE 2>/dev/null; then
+		# Add the NAT rule if it does not exist
+		iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$net_dev" -j MASQUERADE
+		# (can we restore it safely after ALL instances of `netns_run` are terminated?)
+		#should_revert_iptables_nat=1
+		#else
+		#should_revert_iptables_nat=0
+	fi
+}
+
+cleanup() {
+	# Kill all (sub)processes
+	for pid in "${pids[@]}"; do
+		kill -9 "$pid" 2>/dev/null
+	done
+
+	# Remove namespaces, links, and DNS configurations
+	for ((idx = "$start_idx"; idx < last_idx; idx++)); do
+		ns="ns$idx"
+		veth="veth$idx"
+		ip netns delete "$ns" 2>/dev/null
+		ip link delete "$veth" 2>/dev/null
+		rm -rf /etc/netns/"$ns" 2>/dev/null
+	done
+
+	# Remove iptables NAT rule if it was added by this script
+	#if [ "$should_revert_iptables_nat" -eq 1 ]; then
+	#  iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$net_dev" -j MASQUERADE 2>/dev/null
+	#fi
+
+	# Revert IP forwarding if it was enabled by this script
+	#if [ "$should_revert_ip_forward" -eq 1 ]; then
+	#  sysctl -w net.ipv4.ip_forward=0 >/dev/null
+	#fi
+}
+
+cleanup_exit() {
+	cleanup
+
+	exit 0
+}
+
+# Ensure the script is run with at least two arguments
+if [ "$#" -lt 4 ]; then
+	echo "Usage: $0 NET_DEV NR_NET START_IDX COMMAND ..."
+	exit 1
+fi
+
+# Pop each argument while keeping the rest arguments for the command to execute
+net_dev=$1
+shift
+nr_net=$1
+shift
+start_idx=$1
+shift
+
+last_idx=$((start_idx + nr_net))
+
+# Make it sure that the side effects from previous invocations are cleaned up
+cleanup
+
+# Check and modify system settings before setting up the network namespaces
+check_ip_forward
+check_iptables_nat
+
+# Set trap for SIGINT, SIGTERM, and EXIT
+trap cleanup_exit SIGINT SIGTERM
+
+# Variables for subnet manipulation
+xxx=$((start_idx / 256))
+yyy=$((start_idx % 256))
+
+for ((idx = "$start_idx"; idx < last_idx; idx++)); do
+	ns="ns$idx"
+	veth="veth$idx"
+	vethns="${veth}ns"
+
+	# Create the network namespace
+	ip netns add "$ns"
+
+	# Create a veth pair
+	ip link add "$veth" type veth peer name "$vethns"
+
+	# Move one end of veth pair to the namespace
+	ip link set "$vethns" netns "$ns"
+
+	# Configure the network interfaces
+	ip addr add "10.$xxx.$yyy.1/24" dev "$veth"
+	ip link set "$veth" up
+
+	ip netns exec "$ns" ip addr add "10.$xxx.$yyy.2/24" dev "$vethns"
+	ip netns exec "$ns" ip link set "$vethns" up
+	ip netns exec "$ns" ip link set lo up
+
+	# Setup default gateway inside the namespace
+	ip netns exec "$ns" ip route add default via 10.$xxx.$yyy.1
+
+	# Setup DNS settings directly
+	mkdir -p /etc/netns/"$ns"
+	echo -e "nameserver 1.1.1.1\nnameserver 1.0.0.1" | tee /etc/netns/"$ns"/resolv.conf >/dev/null
+
+	source "$SCRIPT_DIRPATH"/bin/activate
+
+	# Run command in the namespace and background it
+	ip netns exec "$ns" "$@" &
+	# Save PID of the background process
+	pids+=($!)
+
+	# Increment yyy, and manage overflow to xxx
+	((yyy++))
+	if [ $yyy -eq 256 ]; then
+		yyy=0
+		((xxx++))
+	fi
+done
+
+# Wait for all backgrounded jobs to finish
+wait
+
+cleanup_exit

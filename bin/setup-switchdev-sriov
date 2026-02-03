@@ -1,0 +1,53 @@
+#!/bin/sh
+set -ex
+
+netdev="$1"
+ovs_br="$2"
+numvfs="$3"
+
+parsed="${netdev%np*}"
+
+ovs-vsctl list-ports "$ovs_br" | grep "$parsed" | xargs -r -I {} ovs-vsctl del-port "$ovs_br" {}
+
+ip link set "$netdev" down
+
+pciaddr=$(ethtool -i "$netdev" | grep bus-info | awk '{print $2}')
+
+echo 0 | tee /sys/bus/pci/devices/"$pciaddr"/sriov_numvfs >/dev/null
+
+devlink dev eswitch set pci/"$pciaddr" mode legacy
+devlink dev eswitch set pci/"$pciaddr" mode switchdev
+
+ethtool -L "$netdev" combined $(nproc)
+# Grep only the first line
+rx_size=$(ethtool -g "$netdev" | grep -m 1 'RX:' | awk '{print $2}')
+tx_size=$(ethtool -g "$netdev" | grep -m 1 'TX:' | awk '{print $2}')
+ethtool -G "$netdev" rx "$rx_size" tx "$tx_size"
+
+echo "$numvfs" | tee /sys/bus/pci/devices/"$pciaddr"/sriov_numvfs >/dev/null
+
+ovs-vsctl add-port "$ovs_br" "$netdev"
+
+netdev_mtu=$(ip -d link show "$netdev" | grep -oP 'maxmtu \K\d+')
+
+ip link set "$netdev" mtu "$netdev_mtu"
+
+ip link set "$netdev" up
+
+i=0
+while [ "$i" -lt "$numvfs" ]; do
+  target_dev="${parsed}r${i}"
+  ethtool -L "$target_dev" combined $(nproc)
+  rx_size=$(ethtool -g "$target_dev" | grep -m 1 'RX:' | awk '{print $2}')
+  tx_size=$(ethtool -g "$target_dev" | grep -m 1 'TX:' | awk '{print $2}')
+  ethtool -G "$target_dev" rx "$rx_size" tx "$tx_size"
+  ovs-vsctl add-port "$ovs_br" "$target_dev"
+  ip link set "$target_dev" mtu "$netdev_mtu"
+  ip link set "$target_dev" up
+  i=$((i + 1))
+done
+
+# List all ports in the OVS bridge, query them for maxmtu, and set the OVS bridge mtu to the lowest value
+maxmtu_list=$(ovs-vsctl list-ports "$ovs_br" | xargs -I {} sh -c 'ip -d link show {} | grep -oP "maxmtu \K\d+"')
+lowest_mtu=$(echo "$maxmtu_list" | sort -n | head -n 1)
+ovs-vsctl set Interface "$ovs_br" mtu_request="$lowest_mtu"

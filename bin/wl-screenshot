@@ -1,0 +1,11 @@
+#!/bin/sh
+
+FILEpath="$HOME/Pictures/$(uuidgen | tr '[:lower:]' '[:upper:]').png"
+
+grim -g "${1:-$(slurp)}" "$FILEpath"
+
+if [ -s "$FILEpath" ]; then
+    cat "$FILEpath" | wl-copy --type image/png
+else
+    rm -f "$FILEpath"
+fi

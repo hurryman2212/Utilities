@@ -1,0 +1,9 @@
+#!/bin/sh
+loginctl unlock-session $(loginctl list-sessions | grep tty1 | awk '{print $1}')
+
+USER_ID=$(id -u)
+export XDG_RUNTIME_DIR="/run/user/$USER_ID"
+export WAYLAND_DISPLAY=$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name "wayland-*" -printf "%f\n" | head -n 1)
+if [ -n "$WAYLAND_DISPLAY" ]; then
+	wtype -k Shift_L
+fi
