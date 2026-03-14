@@ -1,0 +1,4 @@
+#!/bin/sh
+OFFSET=${1:-1}
+cliphist decode "$(cliphist list | sed -n "${OFFSET}p" | cut -f1)" | wl-copy
+wl-paste | sed -z '$ s/\n$//' | xclip -selection clipboard
