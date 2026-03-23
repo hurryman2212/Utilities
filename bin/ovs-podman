@@ -1,0 +1,629 @@
+#!/bin/bash
+# Copyright (C) 2014 Nicira, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Derived from ovs-docker and adapted for Podman containers.
+
+# Check for programs we'll need.
+search_path() {
+	save_IFS=$IFS
+	IFS=:
+	for dir in $PATH; do
+		IFS=$save_IFS
+		if test -x "$dir/$1"; then
+			return 0
+		fi
+	done
+	IFS=$save_IFS
+	echo >&2 "$0: $1 not found in \$PATH, please install and try again"
+	exit 1
+}
+
+ovs_vsctl() {
+	ovs-vsctl --timeout=60 "$@"
+}
+
+podman_for_container() {
+	PODMAN_SUDO_USER=${OVS_PODMAN_SUDO_USER:-$SUDO_USER}
+
+	if [ -n "$PODMAN_SUDO_USER" ] && [ "$PODMAN_SUDO_USER" != "root" ] &&
+		command -v sudo >/dev/null 2>&1; then
+		SUDO_UID=$(id -u "$PODMAN_SUDO_USER" 2>/dev/null)
+		if [ -n "$SUDO_UID" ]; then
+			sudo -u "$PODMAN_SUDO_USER" -- \
+				env "XDG_RUNTIME_DIR=/run/user/$SUDO_UID" \
+				podman "$@" && return 0
+		fi
+	fi
+
+	podman "$@"
+}
+
+sanitize_name() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+get_dhcp_state_dir() {
+	CONTAINER_SAFE=$(sanitize_name "$1")
+	INTERFACE_SAFE=$(sanitize_name "$2")
+
+	printf '%s/%s-%s\n' "$DHCP_STATE_ROOT" "$CONTAINER_SAFE" \
+		"$INTERFACE_SAFE"
+}
+
+create_netns_link() {
+	mkdir -p /var/run/netns
+	if [ ! -e /var/run/netns/"$PID" ]; then
+		ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
+		trap 'delete_netns_link' 0
+		for signal in 1 2 3 13 14 15; do
+			trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
+		done
+	fi
+}
+
+delete_netns_link() {
+	rm -f /var/run/netns/"$PID"
+}
+
+stop_dhcp_interface() {
+	CONTAINER="$1"
+	INTERFACE="$2"
+	STATE_DIR=$(get_dhcp_state_dir "$CONTAINER" "$INTERFACE")
+	PIDFILE="$STATE_DIR/udhcpc.pid"
+
+	if [ -r "$PIDFILE" ]; then
+		UDHCPC_PID=$(cat "$PIDFILE" 2>/dev/null)
+		if [ -n "$UDHCPC_PID" ] &&
+			kill -0 "$UDHCPC_PID" 2>/dev/null &&
+			tr '\0' ' ' </proc/"$UDHCPC_PID"/cmdline 2>/dev/null |
+			grep -q 'udhcpc'; then
+			kill -USR2 "$UDHCPC_PID" 2>/dev/null || true
+			kill "$UDHCPC_PID" 2>/dev/null || true
+		fi
+	fi
+
+	rm -f "$STATE_DIR/udhcpc.pid" "$STATE_DIR/udhcpc.log"
+	rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
+get_container_pid() {
+	CONTAINER="$1"
+
+	PID=$(podman_for_container inspect --type container -f '{{.State.Pid}}' \
+		"$CONTAINER" 2>/dev/null)
+	if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+		echo "$PID"
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to get a running PID for CONTAINER=$CONTAINER"
+	return 1
+}
+
+get_port_for_container_interface() {
+	CONTAINER="$1"
+	INTERFACE="$2"
+
+	PORT=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
+		external_ids:container_id="$CONTAINER" \
+		external_ids:container_iface="$INTERFACE")
+	if [ -z "$PORT" ]; then
+		echo >&2 "$UTIL: Failed to find any attached port" \
+			"for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+	fi
+	echo "$PORT"
+}
+
+get_dhcpcd_lease_value() {
+	KEY="$1"
+
+	printf '%s\n' "$DHCPCD_LEASE" | awk -F= -v key="$KEY" '
+		$1 == key {
+			value = $0
+			sub(/^[^=]*=/, "", value)
+			sub(/^'\''/, "", value)
+			sub(/'\''$/, "", value)
+			print value
+			exit
+		}'
+}
+
+set_container_resolv_conf_from_dhcp() {
+	CONTAINER="$1"
+	DNS_SERVERS=$(get_dhcpcd_lease_value new_domain_name_servers)
+	DNS_SEARCH=$(get_dhcpcd_lease_value new_domain_search)
+
+	set_container_resolv_conf "$CONTAINER" "$DNS_SERVERS" "$DNS_SEARCH"
+}
+
+set_container_resolv_conf() {
+	CONTAINER="$1"
+	DNS_SERVERS="$2"
+	DNS_SEARCH="$3"
+
+	if [ -z "$DNS_SERVERS" ]; then
+		return 0
+	fi
+
+	RESOLV_CONF=""
+	if [ -n "$DNS_SEARCH" ]; then
+		RESOLV_CONF="search $DNS_SEARCH\n"
+	fi
+
+	for DNS_SERVER in $DNS_SERVERS; do
+		RESOLV_CONF="${RESOLV_CONF}nameserver $DNS_SERVER\n"
+	done
+
+	if printf '%b' "$RESOLV_CONF" |
+		podman_for_container exec -i "$CONTAINER" \
+			sh -c 'cat > /etc/resolv.conf'; then :; else
+		echo >&2 "$UTIL: Warning: DHCP lease acquired, but failed to update" \
+			"/etc/resolv.conf in CONTAINER=$CONTAINER"
+	fi
+}
+
+prefix_length_from_subnet() {
+	case "$1" in
+	255.255.255.255) echo 32 ;;
+	255.255.255.254) echo 31 ;;
+	255.255.255.252) echo 30 ;;
+	255.255.255.248) echo 29 ;;
+	255.255.255.240) echo 28 ;;
+	255.255.255.224) echo 27 ;;
+	255.255.255.192) echo 26 ;;
+	255.255.255.128) echo 25 ;;
+	255.255.255.0) echo 24 ;;
+	255.255.254.0) echo 23 ;;
+	255.255.252.0) echo 22 ;;
+	255.255.248.0) echo 21 ;;
+	255.255.240.0) echo 20 ;;
+	255.255.224.0) echo 19 ;;
+	255.255.192.0) echo 18 ;;
+	255.255.128.0) echo 17 ;;
+	255.255.0.0) echo 16 ;;
+	255.254.0.0) echo 15 ;;
+	255.252.0.0) echo 14 ;;
+	255.248.0.0) echo 13 ;;
+	255.240.0.0) echo 12 ;;
+	255.224.0.0) echo 11 ;;
+	255.192.0.0) echo 10 ;;
+	255.128.0.0) echo 9 ;;
+	255.0.0.0) echo 8 ;;
+	254.0.0.0) echo 7 ;;
+	252.0.0.0) echo 6 ;;
+	248.0.0.0) echo 5 ;;
+	240.0.0.0) echo 4 ;;
+	224.0.0.0) echo 3 ;;
+	192.0.0.0) echo 2 ;;
+	128.0.0.0) echo 1 ;;
+	0.0.0.0) echo 0 ;;
+	*)
+		echo >&2 "$UTIL: unsupported subnet mask: $1"
+		return 1
+		;;
+	esac
+}
+
+run_udhcpc_hook() {
+	REASON="$1"
+	PREFIX=32
+
+	case "$REASON" in
+	deconfig)
+		ip addr flush dev "$interface" scope global 2>/dev/null || true
+		ip route flush dev "$interface" 2>/dev/null || true
+		;;
+	bound | renew)
+		if [ -n "${subnet:-}" ]; then
+			PREFIX=$(prefix_length_from_subnet "$subnet")
+		elif [ -n "${mask:-}" ]; then
+			PREFIX="$mask"
+		fi
+
+		ip link set "$interface" up
+		ip addr flush dev "$interface" scope global 2>/dev/null || true
+		ip route flush dev "$interface" 2>/dev/null || true
+
+		if [ -n "${broadcast:-}" ]; then
+			ip addr add "$ip/$PREFIX" broadcast "$broadcast" dev "$interface"
+		else
+			ip addr add "$ip/$PREFIX" dev "$interface"
+		fi
+
+		for ROUTER in ${router:-}; do
+			ip route add default via "$ROUTER" dev "$interface" 2>/dev/null ||
+				ip route replace default via "$ROUTER" dev "$interface"
+		done
+
+		DNS_SEARCH=${search:-${domain:-}}
+		if [ -n "${OVS_PODMAN_CONTAINER:-}" ]; then
+			set_container_resolv_conf "$OVS_PODMAN_CONTAINER" "${dns:-}" \
+				"$DNS_SEARCH"
+		fi
+		;;
+	*) ;;
+	esac
+}
+
+configure_dhcp_interface() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+
+	if command -v busybox >/dev/null 2>&1 &&
+		busybox --list 2>/dev/null | grep -qx udhcpc; then
+		configure_dhcp_interface_with_udhcpc "$INTERFACE" "$CONTAINER"
+		return $?
+	fi
+
+	echo >&2 "$UTIL: Warning: busybox udhcpc not available, falling back" \
+		"to one-shot dhcpcd without automatic lease renewal"
+	configure_dhcp_interface_with_dhcpcd "$INTERFACE" "$CONTAINER"
+}
+
+wait_for_dhcp_ipv4_address() {
+	NETNS_PID="$1"
+	INTERFACE="$2"
+	PIDFILE="$3"
+	ATTEMPTS=0
+
+	while [ "$ATTEMPTS" -lt 150 ]; do
+		if ip netns exec "$NETNS_PID" \
+			ip -4 -o addr show dev "$INTERFACE" scope global |
+			grep -q ' inet '; then
+			return 0
+		fi
+
+		if [ -r "$PIDFILE" ]; then
+			UDHCPC_PID=$(cat "$PIDFILE" 2>/dev/null)
+			if [ -n "$UDHCPC_PID" ] &&
+				! kill -0 "$UDHCPC_PID" 2>/dev/null; then
+				return 1
+			fi
+		fi
+
+		sleep 0.2
+		ATTEMPTS=$((ATTEMPTS + 1))
+	done
+
+	return 1
+}
+
+configure_dhcp_interface_with_udhcpc() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+	STATE_DIR=$(get_dhcp_state_dir "$CONTAINER" "$INTERFACE")
+	PIDFILE="$STATE_DIR/udhcpc.pid"
+	LOGFILE="$STATE_DIR/udhcpc.log"
+
+	search_path busybox
+
+	mkdir -p "$DHCP_STATE_ROOT" "$STATE_DIR"
+	rm -f "$PIDFILE" "$LOGFILE"
+
+	if ip netns exec "$PID" env \
+		"OVS_PODMAN_CONTAINER=$CONTAINER" \
+		"OVS_PODMAN_UDHCPC_HOOK=1" \
+		"OVS_PODMAN_PODMAN_BIN=$(command -v podman)" \
+		"OVS_PODMAN_SUDO_USER=${SUDO_USER:-}" \
+		sh -c 'busybox setsid busybox udhcpc -f -S -n -R \
+			-i "$1" -s "$2" -p "$3" >"$4" 2>&1 &' \
+		sh "$INTERFACE" "$SCRIPT_PATH" "$PIDFILE" "$LOGFILE"; then :; else
+		echo >&2 "$UTIL: Failed to start a DHCP client for" \
+			"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+		return 1
+	fi
+
+	if wait_for_dhcp_ipv4_address "$PID" "$INTERFACE" "$PIDFILE"; then
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to acquire a DHCP lease for" \
+		"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE" \
+		"(see $LOGFILE)"
+	stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+	return 1
+}
+
+configure_dhcp_interface_with_dhcpcd() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+
+	search_path dhcpcd
+
+	if ip netns exec "$PID" dhcpcd -1 -4 --waitip=4 -L \
+		-C resolv.conf -C hostname "$INTERFACE"; then
+		DHCPCD_LEASE=$(ip netns exec "$PID" dhcpcd -U -4 "$INTERFACE" \
+			2>/dev/null)
+		if [ -n "$DHCPCD_LEASE" ]; then
+			set_container_resolv_conf_from_dhcp "$CONTAINER"
+		fi
+	else
+		echo >&2 "$UTIL: Failed to acquire a DHCP lease for" \
+			"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		return 1
+	fi
+}
+
+add_port() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER="$3"
+
+	if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
+		echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
+		exit 1
+	fi
+
+	shift 3
+	while [ $# -ne 0 ]; do
+		case $1 in
+		--ipaddress=*)
+			ADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--macaddress=*)
+			MACADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--gateway=*)
+			GATEWAY=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--dhcp)
+			USE_DHCP=yes
+			shift
+			;;
+		--mtu=*)
+			MTU=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		*)
+			echo >&2 "$UTIL add-port: unknown option \"$1\""
+			exit 1
+			;;
+		esac
+	done
+
+	# Check if a port is already attached for the given container and interface.
+	PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+		2>/dev/null)
+	if [ -n "$PORT" ]; then
+		echo >&2 "$UTIL: Port already attached" \
+			"for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		exit 1
+	fi
+
+	if [ -n "$USE_DHCP" ] && { [ -n "$ADDRESS" ] || [ -n "$GATEWAY" ]; }; then
+		echo >&2 "$UTIL add-port: --dhcp cannot be used together with" \
+			"--ipaddress or --gateway"
+		exit 1
+	fi
+
+	if ovs_vsctl br-exists "$BRIDGE" ||
+		ovs_vsctl add-br "$BRIDGE"; then :; else
+		echo >&2 "$UTIL: Failed to create bridge $BRIDGE"
+		exit 1
+	fi
+
+	if PID=$(get_container_pid "$CONTAINER"); then :; else
+		exit 1
+	fi
+
+	create_netns_link
+
+	# Create a veth pair.
+	ID=$(uuidgen | sed 's/-//g')
+	PORTNAME="${ID:0:13}"
+	ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+
+	# Add one end of veth to the OVS bridge.
+	if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
+		-- set interface "${PORTNAME}_l" \
+		external_ids:container_id="$CONTAINER" \
+		external_ids:container_iface="$INTERFACE"; then :; else
+		echo >&2 "$UTIL: Failed to add ${PORTNAME}_l port to bridge $BRIDGE"
+		ip link delete "${PORTNAME}_l"
+		exit 1
+	fi
+
+	ip link set "${PORTNAME}_l" up
+
+	# Move "${PORTNAME}_c" inside the container and change its name.
+	ip link set "${PORTNAME}_c" netns "$PID"
+	ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+	ip netns exec "$PID" ip link set "$INTERFACE" up
+
+	if [ -n "$MTU" ]; then
+		ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
+	fi
+
+	if [ -n "$ADDRESS" ]; then
+		ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
+	fi
+
+	if [ -n "$MACADDRESS" ]; then
+		ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
+	fi
+
+	if [ -n "$GATEWAY" ]; then
+		ip netns exec "$PID" ip route add default via "$GATEWAY"
+	fi
+
+	if [ -n "$USE_DHCP" ]; then
+		configure_dhcp_interface "$INTERFACE" "$CONTAINER"
+	fi
+}
+
+del_port() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER="$3"
+
+	if [ "$#" -lt 3 ]; then
+		usage
+		exit 1
+	fi
+
+	PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE")
+	if [ -z "$PORT" ]; then
+		exit 1
+	fi
+
+	stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+	ovs_vsctl --if-exists del-port "$PORT"
+
+	ip link delete "$PORT"
+}
+
+del_ports() {
+	BRIDGE="$1"
+	CONTAINER="$2"
+	if [ "$#" -lt 2 ]; then
+		usage
+		exit 1
+	fi
+
+	PORTS=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
+		external_ids:container_id="$CONTAINER")
+	if [ -z "$PORTS" ]; then
+		exit 0
+	fi
+
+	for PORT in $PORTS; do
+		CONTAINER_INTERFACE=$(ovs_vsctl --if-exists get interface "$PORT" \
+			external_ids:container_iface 2>/dev/null | tr -d '"')
+		if [ -n "$CONTAINER_INTERFACE" ] &&
+			[ "$CONTAINER_INTERFACE" != "[]" ]; then
+			stop_dhcp_interface "$CONTAINER" "$CONTAINER_INTERFACE"
+		fi
+		ovs_vsctl --if-exists del-port "$PORT"
+		ip link delete "$PORT"
+	done
+}
+
+set_vlan() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER_ID="$3"
+	VLAN="$4"
+
+	if [ "$#" -lt 4 ]; then
+		usage
+		exit 1
+	fi
+
+	PORT=$(get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE")
+	if [ -z "$PORT" ]; then
+		exit 1
+	fi
+	ovs_vsctl set port "$PORT" tag="$VLAN"
+}
+
+usage() {
+	cat <<EOF
+${UTIL}: Performs integration of Open vSwitch with Podman.
+usage: ${UTIL} COMMAND
+
+Commands:
+  add-port BRIDGE INTERFACE CONTAINER [--ipaddress="ADDRESS"]
+                    [--gateway=GATEWAY] [--macaddress="MACADDRESS"]
+                    [--mtu=MTU] [--dhcp]
+                    Adds INTERFACE inside running CONTAINER and connects it as
+                    a port in Open vSwitch BRIDGE. Optionally, sets ADDRESS on
+                    INTERFACE. ADDRESS can include a '/' to represent network
+                    prefix length. Optionally, sets a GATEWAY, MACADDRESS and
+                    MTU. With --dhcp, starts a persistent DHCP client, keeps
+                    renewing the lease, and writes DNS servers to
+                    /etc/resolv.conf inside the container.
+                    --dhcp cannot be combined with --ipaddress or --gateway.
+                    Rootful Podman is required. e.g.:
+                    ${UTIL} add-port br-int eth1 my-container
+                    --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
+                    --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
+                    ${UTIL} add-port br-int eth1 my-container --dhcp
+  del-port BRIDGE INTERFACE CONTAINER
+                    Deletes INTERFACE inside CONTAINER and removes its
+                    connection to Open vSwitch BRIDGE. e.g.:
+                    ${UTIL} del-port br-int eth1 my-container
+  del-ports BRIDGE CONTAINER
+                    Removes all Open vSwitch interfaces from CONTAINER. e.g.:
+                    ${UTIL} del-ports br-int my-container
+  set-vlan BRIDGE INTERFACE CONTAINER VLAN
+                    Configures the INTERFACE of CONTAINER attached to BRIDGE
+                    to become an access port of VLAN. e.g.:
+                    ${UTIL} set-vlan br-int eth1 my-container 5
+Options:
+  -h, --help        display this help message.
+EOF
+}
+
+UTIL=$(basename "$0")
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+if [ -z "$SCRIPT_PATH" ]; then
+	SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+DHCP_STATE_ROOT="/run/${UTIL}-dhcp"
+
+if [ -n "${OVS_PODMAN_UDHCPC_HOOK:-}" ]; then
+	run_udhcpc_hook "$@"
+	exit $?
+fi
+
+search_path ovs-vsctl
+search_path podman
+search_path uuidgen
+
+if (ip netns) >/dev/null 2>&1; then :; else
+	echo >&2 "$UTIL: ip utility not found (or it does not support netns)," \
+		"cannot proceed"
+	exit 1
+fi
+
+if [ $# -eq 0 ]; then
+	usage
+	exit 0
+fi
+
+case $1 in
+"add-port")
+	shift
+	add_port "$@"
+	exit 0
+	;;
+"del-port")
+	shift
+	del_port "$@"
+	exit 0
+	;;
+"del-ports")
+	shift
+	del_ports "$@"
+	exit 0
+	;;
+"set-vlan")
+	shift
+	set_vlan "$@"
+	exit 0
+	;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	echo >&2 "$UTIL: unknown command \"$1\" (use --help for help)"
+	exit 1
+	;;
+esac

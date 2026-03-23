@@ -1,0 +1,19 @@
+#!/bin/bash
+
+PID=$(pgrep -x swayidle | head -n 1)
+
+if [ -z "$PID" ]; then
+	notify-send -h string:x-canonical-private-synchronous:toggle-swayidle "swayidle" "error: Process not found. Is swayidle running?"
+	exit 1
+fi
+
+STATE=$(ps -o state= -p "$PID")
+STATE=$(echo "$STATE" | xargs)
+
+if [ "$STATE" == "T" ]; then
+	killall -SIGCONT swayidle
+	notify-send -h string:x-canonical-private-synchronous:toggle-swayidle -t 5000 "swayidle" "Screen timeout ENABLED"
+else
+	killall -SIGSTOP swayidle
+	notify-send -h string:x-canonical-private-synchronous:toggle-swayidle -t 5000 "swayidle" "Screen timeout DISABLED"
+fi
