@@ -1,0 +1,2 @@
+#!/bin/sh
+env __NV_PRIME_RENDER_OFFLOAD=0 __GLX_VENDOR_LIBRARY_NAME=mesa __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json $@

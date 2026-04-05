@@ -1,0 +1,14 @@
+#!/bin/sh
+
+FILEpath="$HOME/Pictures/$(uuidgen | tr '[:lower:]' '[:upper:]').png"
+
+grim -g "${1:-$(slurp)}" "$FILEpath"
+
+if [ -s "$FILEpath" ]; then
+	cat "$FILEpath" | wl-copy --type image/png
+	if [ -n "$1" ]; then
+		notify-send -h string:x-canonical-private-synchronous:wl-screenshot -t 5000 "grim" "Screenshot has been taken."
+	fi
+else
+	rm -f "$FILEpath"
+fi

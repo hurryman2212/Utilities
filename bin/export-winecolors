@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+# Scrape colors from GTK and import them into Wine through the registry
+#
+# Based on script by endolith [Gist]
+# https://gist.github.com/endolith/74192
+#
+# Based on script by KillerKiwi [Ubuntu Forums] October 29th, 2007
+# http://ubuntuforums.org/showthread.php?t=55286&page=3#23
+#
+# which is based on patch by Johannes Roith [Mono-winforms-list] Wed, 27 Aug 2003
+# http://lists.ximian.com/pipermail/mono-winforms-list/2003-August/000469.html
+
+import os, re, sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk as gtk, Gio, Gdk
+from tempfile import NamedTemporaryFile
+
+# basic command line switches
+if "-v" in sys.argv:
+    debug_mode = True
+else:
+    debug_mode = False
+
+if "-l" in sys.argv:
+    print("Making lighter colors...")
+    lighter = True
+else:
+    lighter = False
+
+if "-ll" in sys.argv:
+    print("Making lightest colors...")
+    lightest = True
+else:
+    lightest = False
+
+if "-nds" in sys.argv:
+    print("No dark shadows...")
+    nodkshad = True
+else:
+    nodkshad = False
+
+
+def format_color_string(color):
+    """Convert GTK color objects to 24-bit 'RRR GGG BBB' triple."""
+    if isinstance(color, Gdk.RGBA):
+        r = int(color.red * 255)
+        g = int(color.green * 255)
+        b = int(color.blue * 255)
+        return f"{r} {g} {b}"
+    print("Unsupported color object: " + str(color))
+    return None
+
+
+def format_hex_color(color):
+    """Convert from hex color string to decimal 'RRR GGG BBB' triple."""
+    if re.match("^#[0-9a-fA-F]{12}$", color):
+        r, g, b = color[1:3], color[5:7], color[9:11]  # rrrrggggbbbb
+    elif re.match("^#[0-9a-fA-F]{6}$", color):
+        r, g, b = color[1:3], color[3:5], color[5:7]  # RRGGBB
+    elif re.match("^#[0-9a-fA-F]{3}$", color):
+        r, g, b = color[1] * 2, color[2] * 2, color[3] * 2  # 09C becomes 0099CC.
+    else:
+        print("Cannot understand color string format: " + str(color))
+        return None
+    return "%s %s %s" % (int(r, 16), int(g, 16), int(b, 16))
+
+
+# TODO: fonts
+
+# Get some colors from GTK
+# gtk.Style object:
+# http://www.moeraki.com/pygtkreference/pygtk2reference/class-gtkstyle.html
+
+# Create a window to scrape colors from
+window = gtk.Window()
+
+button = gtk.Button()
+box = gtk.Box(orientation=gtk.Orientation.VERTICAL)
+box.add(button)
+
+scrollbar = gtk.Scrollbar()
+box.add(scrollbar)
+
+menubar = gtk.MenuBar()
+menuitem = gtk.MenuItem()
+menubar.add(menuitem)
+box.add(menubar)
+
+window.add(box)
+window.show_all()
+
+# Tooltips
+# http://www.daa.com.au/pipermail/pygtk/2005-November/011353.html
+tooltip = gtk.Window()
+tooltip.set_name("gtk-tooltips")
+tooltip.show_all()
+
+
+def lookup(widget, name):
+    ctx = widget.get_style_context()
+    try:
+        ok, rgba = ctx.lookup_color(name)
+        return rgba if ok else None
+    except Exception:
+        return None
+
+
+# Mappings for all the color values (described in readme.txt)
+# TODO: Need to mark which colors do not work with which themes and double-check EVERYTHING
+# * = Confirmed to work exactly for all themes (except Darklooks)
+# + = Not perfect, but close?
+# ? = Nothing to scrape? - Chose something similar
+
+gtk_colors = {
+    "TitleText": lookup(window, "theme_selected_fg_color"),
+    "InactiveTitleText": lookup(window, "theme_fg_color"),
+    "ActiveTitle": lookup(window, "theme_selected_bg_color"),
+    "InactiveTitle": lookup(window, "theme_bg_color"),
+    "GradientActiveTitle": lookup(window, "theme_selected_bg_color"),
+    "GradientInactiveTitle": lookup(window, "theme_bg_color"),
+    "ActiveBorder": lookup(button, "theme_bg_color"),
+    "InactiveBorder": lookup(button, "theme_bg_color"),
+    "AppWorkSpace": lookup(window, "theme_bg_color"),
+    "Background": None,
+    "ButtonText": lookup(button, "theme_fg_color"),
+    "ButtonHilight": lookup(button, "theme_bg_color"),
+    "ButtonLight": lookup(button, "theme_bg_color"),
+    "ButtonFace": lookup(button, "theme_bg_color"),
+    "ButtonAlternateFace": lookup(button, "theme_bg_color"),
+    "ButtonShadow": lookup(button, "theme_selected_bg_color"),
+    "ButtonDkShadow": lookup(button, "theme_selected_bg_color"),
+    "GrayText": lookup(window, "insensitive_fg_color"),
+    "Hilight": lookup(window, "theme_selected_bg_color"),
+    "HilightText": lookup(window, "theme_selected_fg_color"),
+    "HotTrackingColor": lookup(button, "theme_bg_color"),
+    "InfoText": lookup(tooltip, "tooltip_fg_color"),
+    "InfoWindow": lookup(tooltip, "tooltip_bg_color"),
+    "Menu": lookup(menuitem, "theme_bg_color"),
+    "MenuBar": lookup(menubar, "theme_bg_color"),
+    "MenuHilight": lookup(menuitem, "theme_selected_bg_color"),
+    "MenuText": lookup(menuitem, "theme_fg_color"),
+    "Scrollbar": lookup(scrollbar, "theme_bg_color"),
+    "Window": lookup(window, "theme_bg_color"),
+    "WindowFrame": lookup(button, "theme_selected_bg_color"),
+    "WindowText": lookup(window, "theme_fg_color"),
+}
+
+# Lighter colors if requested
+if lighter or lightest:
+    buttons_color = lookup(button, "theme_bg_color")
+    shadows_color = lookup(button, "theme_selected_bg_color")
+    if buttons_color:
+        gtk_colors["ButtonFace"] = buttons_color
+        gtk_colors["ButtonAlternateFace"] = buttons_color
+        gtk_colors["ButtonLight"] = buttons_color
+    if shadows_color:
+        gtk_colors["ButtonShadow"] = shadows_color
+        gtk_colors["ButtonDkShadow"] = buttons_color if nodkshad else shadows_color
+elif nodkshad:
+    dk = lookup(button, "theme_bg_color")
+    if dk:
+        gtk_colors["ButtonDkShadow"] = dk
+
+
+# As far as I know, there is no way to programmatically extract colors from GTK for the same elements in any engine, so we'll have to add engine-specific scrapers.
+# "Engines can and do whatever they want with the colors from the rc file ... A theme includes both the colors, and the code that paints using colors. So the code can use any of the colors it wants."
+# TODO: something like this:
+
+print("GTK engine: GTK3 theme")
+
+# QtPixbufStyle GlideStyle PixbufStyle HcStyle IndustrialStyle MistStyle ThiniceStyle darklooks = gtk.Style
+
+
+# Create list of formatted color value pair strings
+# Windows theme values are in the form name=data with no spaces
+color_pairs = []
+for name, data in gtk_colors.items():
+    if isinstance(data, Gdk.RGBA):
+        s = format_color_string(data)
+        if s:
+            color_pairs.append(f"{name}={s}")
+
+
+# Get Desktop background color from GNOME via GSettings, append to color pair list
+# Fallbacks: try GNOME key, else skip if unavailable
+desktop_color = None
+try:
+    settings = Gio.Settings.new("org.gnome.desktop.background")
+    # GNOME stores as hex string like '#rrggbb' in 'primary-color'
+    color_str = settings.get_string("primary-color")
+    if color_str:
+        desktop_color = format_hex_color(color_str)
+except Exception:
+    desktop_color = None
+if desktop_color:
+    color_pairs.append("Background=%s" % desktop_color)
+
+# TODO: Get Desktop background color from Xfce
+# import xfce4?
+# "i see, yes xfce does have something like that. you find it in /home/$USER/.config/xfce4/mcs_settings/desktop.xml"
+
+with open("winecolors.theme", "w+") as f:
+    f.write(
+        """[Theme]
+DisplayName=GTK-based
+[Control Panel\\Colors]
+"""
+    )
+
+    # Alphabetize list (purely so that it's easy to read; Wine doesn't care)
+    color_pairs = sorted(color_pairs)
+
+    # Append list to file, with newlines
+    f.writelines(line + "\n" for line in color_pairs)
+    f.flush()
+
+    # Debugging
+    if debug_mode:
+        print("---- [" + f.name + "] ----")
+        f.seek(0)
+        for line in f:
+            print(line, end="")
+        print("--------\n")
+
+print("Done!")
