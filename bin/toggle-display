@@ -1,0 +1,7 @@
+#!/bin/sh
+cec-ctl --playback >/dev/null 2>&1
+if cec-ctl --to 0 --give-device-power-status | grep -q "pwr-state: on"; then
+    cec-ctl --to 0 --standby >/dev/null 2>&1
+else
+    cec-ctl --to 0 --image-view-on >/dev/null 2>&1
+fi

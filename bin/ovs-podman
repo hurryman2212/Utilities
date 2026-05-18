@@ -1,0 +1,1504 @@
+#!/bin/bash
+# Copyright (C) 2014 Nicira, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Derived from ovs-docker and adapted for Podman containers.
+
+# Check for programs we'll need.
+search_path() {
+	save_IFS=$IFS
+	IFS=:
+	for dir in $PATH; do
+		IFS=$save_IFS
+		if test -x "$dir/$1"; then
+			return 0
+		fi
+	done
+	IFS=$save_IFS
+	echo >&2 "$0: $1 not found in \$PATH, please install and try again"
+	exit 1
+}
+
+ovs_vsctl() {
+	ovs-vsctl --timeout=60 "$@"
+}
+
+podman_for_container() {
+	PODMAN_SUDO_USER=${OVS_PODMAN_SUDO_USER:-$SUDO_USER}
+
+	if [ -n "$PODMAN_SUDO_USER" ] && [ "$PODMAN_SUDO_USER" != "root" ] &&
+		command -v sudo >/dev/null 2>&1; then
+		SUDO_UID=$(id -u "$PODMAN_SUDO_USER" 2>/dev/null)
+		if [ -n "$SUDO_UID" ]; then
+			sudo -u "$PODMAN_SUDO_USER" -- \
+				env "XDG_RUNTIME_DIR=/run/user/$SUDO_UID" \
+				podman "$@" && return 0
+		fi
+	fi
+
+	podman "$@"
+}
+
+sanitize_name() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+get_dhcp_state_dir() {
+	CONTAINER_SAFE=$(sanitize_name "$1")
+	INTERFACE_SAFE=$(sanitize_name "$2")
+
+	printf '%s/%s-%s\n' "$DHCP_STATE_ROOT" "$CONTAINER_SAFE" \
+		"$INTERFACE_SAFE"
+}
+
+create_netns_link() {
+	mkdir -p /var/run/netns
+	if [ ! -e /var/run/netns/"$PID" ]; then
+		ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
+		trap 'delete_netns_link' 0
+		for signal in 1 2 3 13 14 15; do
+			trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
+		done
+	fi
+}
+
+delete_netns_link() {
+	rm -f /var/run/netns/"$PID"
+}
+
+stop_dhcp_interface() {
+	CONTAINER="$1"
+	INTERFACE="$2"
+	STATE_DIR=$(get_dhcp_state_dir "$CONTAINER" "$INTERFACE")
+	PIDFILE="$STATE_DIR/udhcpc.pid"
+
+	if [ -r "$PIDFILE" ]; then
+		UDHCPC_PID=$(cat "$PIDFILE" 2>/dev/null)
+		if [ -n "$UDHCPC_PID" ] &&
+			kill -0 "$UDHCPC_PID" 2>/dev/null &&
+			tr '\0' ' ' </proc/"$UDHCPC_PID"/cmdline 2>/dev/null |
+			grep -q 'udhcpc'; then
+			kill -USR2 "$UDHCPC_PID" 2>/dev/null || true
+			kill "$UDHCPC_PID" 2>/dev/null || true
+		fi
+	fi
+
+	rm -f "$STATE_DIR/udhcpc.pid" "$STATE_DIR/udhcpc.log"
+	rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
+maybe_get_container_pid() {
+	CONTAINER="$1"
+
+	PID=$(podman_for_container inspect --type container -f '{{.State.Pid}}' \
+		"$CONTAINER" 2>/dev/null)
+	if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+		echo "$PID"
+	fi
+}
+
+get_container_pid() {
+	CONTAINER="$1"
+
+	PID=$(maybe_get_container_pid "$CONTAINER")
+	if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+		echo "$PID"
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to get a running PID for CONTAINER=$CONTAINER"
+	return 1
+}
+
+get_port_for_container_interface() {
+	CONTAINER="$1"
+	INTERFACE="$2"
+
+	PORT=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
+		external_ids:container_id="$CONTAINER" \
+		external_ids:container_iface="$INTERFACE")
+	if [ -z "$PORT" ]; then
+		echo >&2 "$UTIL: Failed to find any attached port" \
+			"for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+	fi
+	echo "$PORT"
+}
+
+get_interface_external_id() {
+	PORT="$1"
+	KEY="$2"
+
+	VALUE=$(ovs_vsctl --if-exists get interface "$PORT" "external_ids:$KEY" \
+		2>/dev/null | tr -d '"')
+	if [ "$VALUE" = "[]" ]; then
+		VALUE=""
+	fi
+	echo "$VALUE"
+}
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+validate_positive_or_minus_one() {
+	OPTION_NAME="$1"
+	OPTION_VALUE="$2"
+
+	case "$OPTION_VALUE" in
+	-1)
+		return 0
+		;;
+	'' | *[!0-9]*)
+		echo >&2 "$UTIL add-port: $OPTION_NAME must be -1 or a positive integer"
+		exit 1
+		;;
+	esac
+
+	if [ "$OPTION_VALUE" -le 0 ]; then
+		echo >&2 "$UTIL add-port: $OPTION_NAME must be -1 or a positive integer"
+		exit 1
+	fi
+}
+
+validate_toggle_or_minus_one() {
+	OPTION_NAME="$1"
+	OPTION_VALUE="$2"
+
+	case "$OPTION_VALUE" in
+	on | off | -1)
+		return 0
+		;;
+	*)
+		echo >&2 "$UTIL add-port: $OPTION_NAME must be one of on, off, -1"
+		exit 1
+		;;
+	esac
+}
+
+mark_optimization_option_seen() {
+	OPTION_NAME="$1"
+
+	if [ "$NO_OPTIMIZATION" = "yes" ]; then
+		echo >&2 "$UTIL add-port: $OPTION_NAME cannot be used together with" \
+			"--no-optimization"
+		exit 1
+	fi
+
+	HAS_OPTIMIZATION_OPTION=yes
+}
+
+disable_all_optimizations() {
+	MTU=-1
+	COMBINED=-1
+	RING_RX=-1
+	RING_TX=-1
+	TSO=-1
+	GSO=-1
+	GRO=-1
+}
+
+get_netdev_device_path() {
+	NETDEV="$1"
+
+	readlink -f "/sys/class/net/$NETDEV/device" 2>/dev/null
+}
+
+get_vf_index_from_representor() {
+	REPRESENTOR="$1"
+	PHYS_PORT_NAME=$(cat "/sys/class/net/$REPRESENTOR/phys_port_name" \
+		2>/dev/null)
+	VF_INDEX=$(printf '%s\n' "$PHYS_PORT_NAME" |
+		sed -n 's/.*vf\([0-9][0-9]*\)$/\1/p')
+
+	if [ -n "$VF_INDEX" ]; then
+		echo "$VF_INDEX"
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to parse VF index from representor" \
+		"DEV=$REPRESENTOR"
+	return 1
+}
+
+get_vf_index_from_vf() {
+	VF_DEV="$1"
+	VF_DEVICE_PATH=$(get_netdev_device_path "$VF_DEV")
+	PF_DEVICE_PATH=$(readlink -f "/sys/class/net/$VF_DEV/device/physfn" \
+		2>/dev/null)
+
+	if [ -z "$VF_DEVICE_PATH" ] || [ -z "$PF_DEVICE_PATH" ]; then
+		echo >&2 "$UTIL: Failed to resolve VF metadata for DEV=$VF_DEV"
+		return 1
+	fi
+
+	for VIRT_FN in "$PF_DEVICE_PATH"/virtfn*; do
+		[ -L "$VIRT_FN" ] || continue
+		if [ "$(readlink -f "$VIRT_FN")" = "$VF_DEVICE_PATH" ]; then
+			echo "${VIRT_FN##*virtfn}"
+			return 0
+		fi
+	done
+
+	echo >&2 "$UTIL: Failed to find VF index for DEV=$VF_DEV"
+	return 1
+}
+
+find_host_netdev_by_pci_address() {
+	PCI_ADDRESS="$1"
+
+	for NETDEV_PATH in /sys/class/net/*; do
+		[ -e "$NETDEV_PATH" ] || continue
+		DEVICE_PATH=$(readlink -f "$NETDEV_PATH/device" 2>/dev/null)
+		[ -n "$DEVICE_PATH" ] || continue
+		if [ "$(basename "$DEVICE_PATH")" = "$PCI_ADDRESS" ]; then
+			basename "$NETDEV_PATH"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+find_netns_netdev_by_pci_address() {
+	NETNS_PID="$1"
+	PCI_ADDRESS="$2"
+
+	nsenter -t "$NETNS_PID" -n sh -c '
+		ip -d -o link show | while IFS= read -r line; do
+			case "$line" in
+			*" parentdev $1 "* | *" parentdev $1")
+				name=${line#*: }
+				name=${name%%:*}
+				name=${name%@*}
+				printf "%s\n" "$name"
+				exit 0
+				;;
+			esac
+		done
+		exit 1
+	' sh "$PCI_ADDRESS"
+}
+
+find_any_netns_netdev_by_pci_address() {
+	PCI_ADDRESS="$1"
+	HOST_NETNS_INODE=$(stat -Lc '%i' /proc/1/ns/net 2>/dev/null)
+	declare -A SEEN_NETNS
+
+	for PID_PATH in /proc/[0-9]*; do
+		[ -r "$PID_PATH/ns/net" ] || continue
+		TARGET_PID="${PID_PATH##*/}"
+		NETNS_INODE=$(stat -Lc '%i' "$PID_PATH/ns/net" 2>/dev/null)
+		[ -n "$NETNS_INODE" ] || continue
+		if [ "$NETNS_INODE" = "$HOST_NETNS_INODE" ] ||
+			[ -n "${SEEN_NETNS[$NETNS_INODE]:-}" ]; then
+			continue
+		fi
+		SEEN_NETNS[$NETNS_INODE]=1
+
+		DEV_IN_NETNS=$(find_netns_netdev_by_pci_address "$TARGET_PID" \
+			"$PCI_ADDRESS" 2>/dev/null)
+		if [ -n "$DEV_IN_NETNS" ]; then
+			printf '%s %s\n' "$TARGET_PID" "$DEV_IN_NETNS"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+extract_max_mtu_from_link_details() {
+	LINK_DETAILS="$1"
+
+	printf '%s\n' "$LINK_DETAILS" |
+		sed -n 's/.* maxmtu \([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+clamp_to_max_mtu() {
+	VALUE="$1"
+	MAX_VALUE="$2"
+
+	if [ -n "$VALUE" ] && [ -n "$MAX_VALUE" ] && [ "$VALUE" -gt "$MAX_VALUE" ]; then
+		echo "$MAX_VALUE"
+	else
+		echo "$VALUE"
+	fi
+}
+
+extract_ring_limit() {
+	RING_OUTPUT="$1"
+	RING_NAME="$2"
+
+	printf '%s\n' "$RING_OUTPUT" | awk -v ring_name="$RING_NAME" '
+		/Pre-set maximums:/ { in_max=1; next }
+		in_max && $1 == ring_name ":" && $2 ~ /^[0-9]+$/ { print $2; exit }
+	'
+}
+
+extract_max_combined_channels() {
+	CHANNEL_OUTPUT="$1"
+
+	printf '%s\n' "$CHANNEL_OUTPUT" | awk '
+		/Pre-set maximums:/ { in_max=1; next }
+		in_max && $1 == "Combined:" && $2 ~ /^[0-9]+$/ { print $2; exit }
+	'
+}
+
+get_interface_target_mtu() {
+	INTERFACE="$1"
+	HOST_PORT="$2"
+
+	NETNS_MAX_MTU=""
+	HOST_MAX_MTU=""
+	TARGET_MTU=""
+
+	if [ "$MTU" = "-1" ]; then
+		return 0
+	fi
+
+	if [ -n "$MTU" ]; then
+		echo "$MTU"
+		return 0
+	fi
+
+	LINK_DETAILS=$(ip netns exec "$PID" ip -d -o link show dev "$INTERFACE" \
+		2>/dev/null)
+	NETNS_MAX_MTU=$(extract_max_mtu_from_link_details "$LINK_DETAILS")
+
+	if [ -n "$HOST_PORT" ]; then
+		LINK_DETAILS=$(ip -d -o link show dev "$HOST_PORT" 2>/dev/null)
+		HOST_MAX_MTU=$(extract_max_mtu_from_link_details "$LINK_DETAILS")
+	fi
+
+	TARGET_MTU="$NETNS_MAX_MTU"
+	if [ -z "$TARGET_MTU" ]; then
+		TARGET_MTU="$HOST_MAX_MTU"
+	fi
+
+	TARGET_MTU=$(clamp_to_max_mtu "$TARGET_MTU" "$NETNS_MAX_MTU")
+	TARGET_MTU=$(clamp_to_max_mtu "$TARGET_MTU" "$HOST_MAX_MTU")
+
+	if [ -n "$TARGET_MTU" ] && [ "$TARGET_MTU" -gt 0 ]; then
+		echo "$TARGET_MTU"
+	fi
+}
+
+apply_combined_channels_in_netns() {
+	INTERFACE="$1"
+	TARGET_COMBINED=""
+	MAX_COMBINED=""
+
+	if [ "$HAVE_ETHTOOL" != "yes" ] || [ "$COMBINED" = "-1" ]; then
+		return 0
+	fi
+
+	if [ -n "$COMBINED" ]; then
+		TARGET_COMBINED="$COMBINED"
+	else
+		if [ -z "$NPROC_COUNT" ]; then
+			return 0
+		fi
+
+		CHANNEL_OUTPUT=$(ip netns exec "$PID" ethtool -l "$INTERFACE" 2>/dev/null ||
+			true)
+		if [ -z "$CHANNEL_OUTPUT" ]; then
+			return 0
+		fi
+
+		MAX_COMBINED=$(extract_max_combined_channels "$CHANNEL_OUTPUT")
+		if [ -z "$MAX_COMBINED" ] || [ "$MAX_COMBINED" -le 0 ]; then
+			return 0
+		fi
+
+		TARGET_COMBINED="$NPROC_COUNT"
+		if [ "$TARGET_COMBINED" -gt "$MAX_COMBINED" ]; then
+			TARGET_COMBINED="$MAX_COMBINED"
+		fi
+	fi
+
+	ip netns exec "$PID" ethtool -L "$INTERFACE" combined "$TARGET_COMBINED" \
+		>/dev/null 2>&1 || true
+}
+
+apply_combined_channels_in_host() {
+	HOST_PORT="$1"
+	TARGET_COMBINED=""
+	MAX_COMBINED=""
+
+	if [ "$HAVE_ETHTOOL" != "yes" ] || [ "$COMBINED" = "-1" ]; then
+		return 0
+	fi
+
+	if [ -n "$COMBINED" ]; then
+		TARGET_COMBINED="$COMBINED"
+	else
+		if [ -z "$NPROC_COUNT" ]; then
+			return 0
+		fi
+
+		CHANNEL_OUTPUT=$(ethtool -l "$HOST_PORT" 2>/dev/null || true)
+		if [ -z "$CHANNEL_OUTPUT" ]; then
+			return 0
+		fi
+
+		MAX_COMBINED=$(extract_max_combined_channels "$CHANNEL_OUTPUT")
+		if [ -z "$MAX_COMBINED" ] || [ "$MAX_COMBINED" -le 0 ]; then
+			return 0
+		fi
+
+		TARGET_COMBINED="$NPROC_COUNT"
+		if [ "$TARGET_COMBINED" -gt "$MAX_COMBINED" ]; then
+			TARGET_COMBINED="$MAX_COMBINED"
+		fi
+	fi
+
+	ethtool -L "$HOST_PORT" combined "$TARGET_COMBINED" >/dev/null 2>&1 ||
+		true
+}
+
+apply_ring_settings_in_netns() {
+	INTERFACE="$1"
+	MAX_RX=""
+	MAX_TX=""
+	TARGET_RX=""
+	TARGET_TX=""
+
+	if [ "$HAVE_ETHTOOL" != "yes" ]; then
+		return 0
+	fi
+
+	if [ "$RING_RX" = "-1" ] && [ "$RING_TX" = "-1" ]; then
+		return 0
+	fi
+
+	RING_OUTPUT=$(ip netns exec "$PID" ethtool -g "$INTERFACE" 2>/dev/null ||
+		true)
+
+	if [ -n "$RING_OUTPUT" ]; then
+		MAX_RX=$(extract_ring_limit "$RING_OUTPUT" RX)
+		MAX_TX=$(extract_ring_limit "$RING_OUTPUT" TX)
+	fi
+
+	if [ "$RING_RX" = "-1" ]; then
+		TARGET_RX=""
+	elif [ -n "$RING_RX" ]; then
+		TARGET_RX="$RING_RX"
+	else
+		TARGET_RX="$MAX_RX"
+	fi
+
+	if [ "$RING_TX" = "-1" ]; then
+		TARGET_TX=""
+	elif [ -n "$RING_TX" ]; then
+		TARGET_TX="$RING_TX"
+	else
+		TARGET_TX="$MAX_TX"
+	fi
+
+	if [ -n "$TARGET_RX" ] || [ -n "$TARGET_TX" ]; then
+		set -- ethtool -G "$INTERFACE"
+		if [ -n "$TARGET_RX" ]; then
+			set -- "$@" rx "$TARGET_RX"
+		fi
+		if [ -n "$TARGET_TX" ]; then
+			set -- "$@" tx "$TARGET_TX"
+		fi
+		ip netns exec "$PID" "$@" >/dev/null 2>&1 || true
+	fi
+}
+
+apply_ring_settings_in_host() {
+	HOST_PORT="$1"
+	MAX_RX=""
+	MAX_TX=""
+	TARGET_RX=""
+	TARGET_TX=""
+
+	if [ "$HAVE_ETHTOOL" != "yes" ]; then
+		return 0
+	fi
+
+	if [ "$RING_RX" = "-1" ] && [ "$RING_TX" = "-1" ]; then
+		return 0
+	fi
+
+	RING_OUTPUT=$(ethtool -g "$HOST_PORT" 2>/dev/null || true)
+
+	if [ -n "$RING_OUTPUT" ]; then
+		MAX_RX=$(extract_ring_limit "$RING_OUTPUT" RX)
+		MAX_TX=$(extract_ring_limit "$RING_OUTPUT" TX)
+	fi
+
+	if [ "$RING_RX" = "-1" ]; then
+		TARGET_RX=""
+	elif [ -n "$RING_RX" ]; then
+		TARGET_RX="$RING_RX"
+	else
+		TARGET_RX="$MAX_RX"
+	fi
+
+	if [ "$RING_TX" = "-1" ]; then
+		TARGET_TX=""
+	elif [ -n "$RING_TX" ]; then
+		TARGET_TX="$RING_TX"
+	else
+		TARGET_TX="$MAX_TX"
+	fi
+
+	if [ -n "$TARGET_RX" ] || [ -n "$TARGET_TX" ]; then
+		set -- ethtool -G "$HOST_PORT"
+		if [ -n "$TARGET_RX" ]; then
+			set -- "$@" rx "$TARGET_RX"
+		fi
+		if [ -n "$TARGET_TX" ]; then
+			set -- "$@" tx "$TARGET_TX"
+		fi
+		"$@" >/dev/null 2>&1 || true
+	fi
+}
+
+apply_offload_in_netns() {
+	INTERFACE="$1"
+	FEATURE_NAME="$2"
+	FEATURE_VALUE="$3"
+
+	if [ "$HAVE_ETHTOOL" != "yes" ] || [ "$FEATURE_VALUE" = "-1" ]; then
+		return 0
+	fi
+
+	if [ -z "$FEATURE_VALUE" ]; then
+		FEATURE_VALUE=on
+	fi
+
+	ip netns exec "$PID" ethtool -K "$INTERFACE" "$FEATURE_NAME" \
+		"$FEATURE_VALUE" >/dev/null 2>&1 || true
+}
+
+apply_offload_in_host() {
+	HOST_PORT="$1"
+	FEATURE_NAME="$2"
+	FEATURE_VALUE="$3"
+
+	if [ "$HAVE_ETHTOOL" != "yes" ] || [ "$FEATURE_VALUE" = "-1" ]; then
+		return 0
+	fi
+
+	if [ -z "$FEATURE_VALUE" ]; then
+		FEATURE_VALUE=on
+	fi
+
+	ethtool -K "$HOST_PORT" "$FEATURE_NAME" "$FEATURE_VALUE" >/dev/null 2>&1 ||
+		true
+}
+
+apply_port_tuning() {
+	INTERFACE="$1"
+	HOST_PORT="$2"
+	TARGET_MTU=$(get_interface_target_mtu "$INTERFACE" "$HOST_PORT")
+
+	if [ -n "$TARGET_MTU" ]; then
+		ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$TARGET_MTU" ||
+			return 1
+		if [ -n "$HOST_PORT" ]; then
+			ovs_vsctl --if-exists set interface "$HOST_PORT" \
+				mtu_request="$TARGET_MTU" >/dev/null 2>&1 || true
+			ip link set dev "$HOST_PORT" mtu "$TARGET_MTU" >/dev/null 2>&1 ||
+				true
+		fi
+	fi
+
+	if [ "$HAVE_ETHTOOL" = "yes" ]; then
+		apply_offload_in_netns "$INTERFACE" tso "$TSO"
+		apply_offload_in_netns "$INTERFACE" gso "$GSO"
+		apply_offload_in_netns "$INTERFACE" gro "$GRO"
+		apply_combined_channels_in_netns "$INTERFACE"
+		apply_ring_settings_in_netns "$INTERFACE"
+
+		if [ -n "$HOST_PORT" ]; then
+			apply_offload_in_host "$HOST_PORT" tso "$TSO"
+			apply_offload_in_host "$HOST_PORT" gso "$GSO"
+			apply_offload_in_host "$HOST_PORT" gro "$GRO"
+			apply_combined_channels_in_host "$HOST_PORT"
+			apply_ring_settings_in_host "$HOST_PORT"
+		fi
+	fi
+}
+
+find_representor_for_pf_index() {
+	PF_DEVICE_PATH="$1"
+	VF_INDEX="$2"
+
+	for NETDEV_PATH in /sys/class/net/*; do
+		[ -e "$NETDEV_PATH" ] || continue
+		DEVICE_PATH=$(readlink -f "$NETDEV_PATH/device" 2>/dev/null)
+		[ "$DEVICE_PATH" = "$PF_DEVICE_PATH" ] || continue
+		[ -r "$NETDEV_PATH/phys_port_name" ] || continue
+		PHYS_PORT_NAME=$(cat "$NETDEV_PATH/phys_port_name" 2>/dev/null)
+		CANDIDATE_INDEX=$(printf '%s\n' "$PHYS_PORT_NAME" |
+			sed -n 's/.*vf\([0-9][0-9]*\)$/\1/p')
+		if [ -n "$CANDIDATE_INDEX" ] && [ "$CANDIDATE_INDEX" = "$VF_INDEX" ]; then
+			basename "$NETDEV_PATH"
+			return 0
+		fi
+	done
+
+	echo >&2 "$UTIL: Failed to find a representor for VF index $VF_INDEX"
+	return 1
+}
+
+find_vf_for_pf_index() {
+	PF_DEVICE_PATH="$1"
+	VF_INDEX="$2"
+
+	if [ ! -L "$PF_DEVICE_PATH/virtfn$VF_INDEX" ]; then
+		echo >&2 "$UTIL: Failed to find VF PCI metadata for VF index $VF_INDEX"
+		return 1
+	fi
+
+	VF_PCI=$(basename "$(readlink -f "$PF_DEVICE_PATH/virtfn$VF_INDEX")")
+	VF_NETDEV=$(find_host_netdev_by_pci_address "$VF_PCI")
+	if [ -n "$VF_NETDEV" ]; then
+		echo "$VF_NETDEV"
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to find a host VF netdev for PCI=$VF_PCI"
+	return 1
+}
+
+classify_sriov_netdev() {
+	NETDEV="$1"
+
+	if [ ! -e "/sys/class/net/$NETDEV" ]; then
+		echo >&2 "$UTIL: NETDEV=$NETDEV does not exist"
+		return 1
+	fi
+
+	if [ -e "/sys/class/net/$NETDEV/device/physfn" ]; then
+		echo vf
+		return 0
+	fi
+
+	if [ -r "/sys/class/net/$NETDEV/phys_port_name" ] &&
+		cat "/sys/class/net/$NETDEV/phys_port_name" 2>/dev/null |
+		grep -Eq 'vf[0-9]+$'; then
+		echo representor
+		return 0
+	fi
+
+	echo >&2 "$UTIL: DEV=$NETDEV is not an SR-IOV VF or representor"
+	return 1
+}
+
+resolve_sriov_devices() {
+	SRIOV_INPUT_DEV="$1"
+	SRIOV_INPUT_TYPE=$(classify_sriov_netdev "$SRIOV_INPUT_DEV") || return 1
+
+	if [ "$SRIOV_INPUT_TYPE" = "vf" ]; then
+		SRIOV_VF_DEV="$SRIOV_INPUT_DEV"
+		SRIOV_PF_DEVICE_PATH=$(readlink -f \
+			"/sys/class/net/$SRIOV_VF_DEV/device/physfn" 2>/dev/null)
+		SRIOV_VF_INDEX=$(get_vf_index_from_vf "$SRIOV_VF_DEV") || return 1
+		SRIOV_REP_DEV=$(find_representor_for_pf_index "$SRIOV_PF_DEVICE_PATH" \
+			"$SRIOV_VF_INDEX") || return 1
+	else
+		SRIOV_REP_DEV="$SRIOV_INPUT_DEV"
+		SRIOV_PF_DEVICE_PATH=$(get_netdev_device_path "$SRIOV_REP_DEV")
+		SRIOV_VF_INDEX=$(get_vf_index_from_representor "$SRIOV_REP_DEV") ||
+			return 1
+		SRIOV_VF_DEV=$(find_vf_for_pf_index "$SRIOV_PF_DEVICE_PATH" \
+			"$SRIOV_VF_INDEX") || return 1
+	fi
+
+	SRIOV_VF_DEVICE_PATH=$(get_netdev_device_path "$SRIOV_VF_DEV")
+	if [ -z "$SRIOV_PF_DEVICE_PATH" ] || [ -z "$SRIOV_VF_DEVICE_PATH" ]; then
+		echo >&2 "$UTIL: Failed to resolve SR-IOV device metadata for" \
+			"DEV=$SRIOV_INPUT_DEV"
+		return 1
+	fi
+
+	SRIOV_VF_PCI=$(basename "$SRIOV_VF_DEVICE_PATH")
+	SRIOV_VF_ORIG_NAME="$SRIOV_VF_DEV"
+	return 0
+}
+
+restore_sriov_vf() {
+	CONTAINER="$1"
+	CONTAINER_INTERFACE="$2"
+	VF_PCI="$3"
+	RESTORE_NAME="$4"
+	RESTORE_MTU="$5"
+	RESTORE_MAC="$6"
+	RESTORE_STATE="$7"
+
+	if [ -z "$VF_PCI" ] || [ -z "$RESTORE_NAME" ]; then
+		echo >&2 "$UTIL: Missing SR-IOV restore metadata for CONTAINER=$CONTAINER" \
+			"and INTERFACE=$CONTAINER_INTERFACE"
+		return 1
+	fi
+
+	CURRENT_DEV=$(find_host_netdev_by_pci_address "$VF_PCI")
+	if [ -z "$CURRENT_DEV" ]; then
+		RESTORE_PID=$(maybe_get_container_pid "$CONTAINER")
+		if [ -n "$RESTORE_PID" ]; then
+			DEV_IN_CONTAINER=$(find_netns_netdev_by_pci_address "$RESTORE_PID" \
+				"$VF_PCI" 2>/dev/null)
+			if [ -z "$DEV_IN_CONTAINER" ] &&
+				nsenter -t "$RESTORE_PID" -n ip link show \
+					"$CONTAINER_INTERFACE" >/dev/null 2>&1; then
+				DEV_IN_CONTAINER="$CONTAINER_INTERFACE"
+			fi
+			if [ -n "$DEV_IN_CONTAINER" ]; then
+				nsenter -t "$RESTORE_PID" -n ip link set "$DEV_IN_CONTAINER" \
+					netns 1 || return 1
+			fi
+			CURRENT_DEV=$(find_host_netdev_by_pci_address "$VF_PCI")
+		fi
+	fi
+
+	if [ -z "$CURRENT_DEV" ]; then
+		FALLBACK_NETNS=$(find_any_netns_netdev_by_pci_address "$VF_PCI" \
+			2>/dev/null)
+		if [ -n "$FALLBACK_NETNS" ]; then
+			FALLBACK_PID="${FALLBACK_NETNS%% *}"
+			FALLBACK_DEV="${FALLBACK_NETNS#* }"
+			nsenter -t "$FALLBACK_PID" -n ip link set "$FALLBACK_DEV" \
+				netns 1 || return 1
+			CURRENT_DEV=$(find_host_netdev_by_pci_address "$VF_PCI")
+		fi
+	fi
+
+	if [ -z "$CURRENT_DEV" ]; then
+		echo >&2 "$UTIL: Failed to locate VF with PCI=$VF_PCI while" \
+			"restoring CONTAINER=$CONTAINER and INTERFACE=$CONTAINER_INTERFACE"
+		return 1
+	fi
+
+	if [ "$CURRENT_DEV" != "$RESTORE_NAME" ]; then
+		ip link set "$CURRENT_DEV" down 2>/dev/null || true
+		if ip -d link show dev "$CURRENT_DEV" 2>/dev/null |
+			grep -Fq "altname $RESTORE_NAME"; then
+			ip link property del dev "$CURRENT_DEV" altname \
+				"$RESTORE_NAME" 2>/dev/null || true
+		fi
+		ip link set "$CURRENT_DEV" name "$RESTORE_NAME" || return 1
+		CURRENT_DEV="$RESTORE_NAME"
+	fi
+
+	if [ -n "$RESTORE_MTU" ]; then
+		ip link set dev "$CURRENT_DEV" mtu "$RESTORE_MTU" || return 1
+	fi
+
+	if [ -n "$RESTORE_MAC" ]; then
+		CURRENT_MAC=$(cat "/sys/class/net/$CURRENT_DEV/address" 2>/dev/null)
+		if [ "$CURRENT_MAC" != "$RESTORE_MAC" ]; then
+			ip link set dev "$CURRENT_DEV" address "$RESTORE_MAC" || return 1
+		fi
+	fi
+
+	if [ "$RESTORE_STATE" = "up" ]; then
+		ip link set "$CURRENT_DEV" up || return 1
+	else
+		ip link set "$CURRENT_DEV" down || return 1
+	fi
+}
+
+configure_container_interface() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+	HOST_PORT="$3"
+
+	ip netns exec "$PID" ip link set "$INTERFACE" up || return 1
+
+	apply_port_tuning "$INTERFACE" "$HOST_PORT" || return 1
+
+	if [ -n "$ADDRESS" ]; then
+		ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE" ||
+			return 1
+	fi
+
+	if [ -n "$MACADDRESS" ]; then
+		ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS" ||
+			return 1
+	fi
+
+	if [ -n "$GATEWAY" ]; then
+		ip netns exec "$PID" ip route add default via "$GATEWAY" || return 1
+	fi
+
+	if [ -n "$USE_DHCP" ]; then
+		configure_dhcp_interface "$INTERFACE" "$CONTAINER" || return 1
+	fi
+}
+
+add_sriov_port() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER="$3"
+	SRIOV_REQUESTED_DEV="$4"
+
+	resolve_sriov_devices "$SRIOV_REQUESTED_DEV" || return 1
+
+	VF_ORIG_MTU=$(cat "/sys/class/net/$SRIOV_VF_DEV/mtu" 2>/dev/null)
+	VF_ORIG_MAC=$(cat "/sys/class/net/$SRIOV_VF_DEV/address" 2>/dev/null)
+	if ip -o link show dev "$SRIOV_VF_DEV" | grep -q '<[^>]*UP'; then
+		VF_ORIG_STATE=up
+	else
+		VF_ORIG_STATE=down
+	fi
+
+	EXISTING_CONTAINER=$(get_interface_external_id "$SRIOV_REP_DEV" \
+		container_id)
+	EXISTING_INTERFACE=$(get_interface_external_id "$SRIOV_REP_DEV" \
+		container_iface)
+	if [ -n "$EXISTING_CONTAINER" ] &&
+		{ [ "$EXISTING_CONTAINER" != "$CONTAINER" ] ||
+			[ "$EXISTING_INTERFACE" != "$INTERFACE" ]; }; then
+		echo >&2 "$UTIL: Representor $SRIOV_REP_DEV is already assigned to" \
+			"CONTAINER=$EXISTING_CONTAINER INTERFACE=$EXISTING_INTERFACE"
+		return 1
+	fi
+
+	ip link set "$SRIOV_VF_DEV" netns "$PID" || return 1
+	ip netns exec "$PID" ip link set dev "$SRIOV_VF_DEV" name "$INTERFACE" || {
+		ip netns exec "$PID" ip link set "$SRIOV_VF_DEV" netns 1 2>/dev/null ||
+			true
+		restore_sriov_vf "$CONTAINER" "$INTERFACE" "$SRIOV_VF_PCI" \
+			"$SRIOV_VF_ORIG_NAME" "$VF_ORIG_MTU" "$VF_ORIG_MAC" \
+			"$VF_ORIG_STATE" >/dev/null 2>&1 || true
+		return 1
+	}
+
+	if ovs_vsctl --may-exist add-port "$BRIDGE" "$SRIOV_REP_DEV" \
+		-- set interface "$SRIOV_REP_DEV" \
+		external_ids:container_id="$CONTAINER" \
+		external_ids:container_iface="$INTERFACE" \
+		external_ids:sriov_mode=true \
+		external_ids:sriov_vf_name="$SRIOV_VF_ORIG_NAME" \
+		external_ids:sriov_vf_pci="$SRIOV_VF_PCI" \
+		external_ids:sriov_vf_mtu="$VF_ORIG_MTU" \
+		external_ids:sriov_vf_mac="$VF_ORIG_MAC" \
+		external_ids:sriov_vf_state="$VF_ORIG_STATE" \
+		external_ids:sriov_rep="$SRIOV_REP_DEV" \
+		external_ids:sriov_input="$SRIOV_REQUESTED_DEV"; then :; else
+		restore_sriov_vf "$CONTAINER" "$INTERFACE" "$SRIOV_VF_PCI" \
+			"$SRIOV_VF_ORIG_NAME" "$VF_ORIG_MTU" "$VF_ORIG_MAC" \
+			"$VF_ORIG_STATE" >/dev/null 2>&1 || true
+		return 1
+	fi
+
+	ip link set "$SRIOV_REP_DEV" up || {
+		ovs_vsctl --if-exists del-port "$SRIOV_REP_DEV"
+		restore_sriov_vf "$CONTAINER" "$INTERFACE" "$SRIOV_VF_PCI" \
+			"$SRIOV_VF_ORIG_NAME" "$VF_ORIG_MTU" "$VF_ORIG_MAC" \
+			"$VF_ORIG_STATE" >/dev/null 2>&1 || true
+		return 1
+	}
+
+	configure_container_interface "$INTERFACE" "$CONTAINER" "$SRIOV_REP_DEV" || {
+		ovs_vsctl --if-exists del-port "$SRIOV_REP_DEV"
+		stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+		restore_sriov_vf "$CONTAINER" "$INTERFACE" "$SRIOV_VF_PCI" \
+			"$SRIOV_VF_ORIG_NAME" "$VF_ORIG_MTU" "$VF_ORIG_MAC" \
+			"$VF_ORIG_STATE" >/dev/null 2>&1 || true
+		return 1
+	}
+}
+
+delete_container_port() {
+	PORT="$1"
+	CONTAINER="$2"
+	CONTAINER_INTERFACE="$3"
+
+	SRIOV_MODE=$(get_interface_external_id "$PORT" sriov_mode)
+	stop_dhcp_interface "$CONTAINER" "$CONTAINER_INTERFACE"
+
+	if [ "$SRIOV_MODE" = "true" ]; then
+		SAVED_VF_NAME=$(get_interface_external_id "$PORT" sriov_vf_name)
+		SAVED_VF_PCI=$(get_interface_external_id "$PORT" sriov_vf_pci)
+		SAVED_VF_MTU=$(get_interface_external_id "$PORT" sriov_vf_mtu)
+		SAVED_VF_MAC=$(get_interface_external_id "$PORT" sriov_vf_mac)
+		SAVED_VF_STATE=$(get_interface_external_id "$PORT" sriov_vf_state)
+		restore_sriov_vf "$CONTAINER" "$CONTAINER_INTERFACE" "$SAVED_VF_PCI" \
+			"$SAVED_VF_NAME" "$SAVED_VF_MTU" "$SAVED_VF_MAC" \
+			"$SAVED_VF_STATE" || return 1
+		ovs_vsctl --if-exists del-port "$PORT"
+		return $?
+	fi
+
+	ovs_vsctl --if-exists del-port "$PORT"
+	ip link delete "$PORT"
+}
+
+get_dhcpcd_lease_value() {
+	KEY="$1"
+
+	printf '%s\n' "$DHCPCD_LEASE" | awk -F= -v key="$KEY" '
+		$1 == key {
+			value = $0
+			sub(/^[^=]*=/, "", value)
+			sub(/^'\''/, "", value)
+			sub(/'\''$/, "", value)
+			print value
+			exit
+		}'
+}
+
+set_container_resolv_conf_from_dhcp() {
+	CONTAINER="$1"
+	DNS_SERVERS=$(get_dhcpcd_lease_value new_domain_name_servers)
+	DNS_SEARCH=$(get_dhcpcd_lease_value new_domain_search)
+
+	set_container_resolv_conf "$CONTAINER" "$DNS_SERVERS" "$DNS_SEARCH"
+}
+
+set_container_resolv_conf() {
+	CONTAINER="$1"
+	DNS_SERVERS="$2"
+	DNS_SEARCH="$3"
+
+	if [ -z "$DNS_SERVERS" ]; then
+		return 0
+	fi
+
+	RESOLV_CONF=""
+	if [ -n "$DNS_SEARCH" ]; then
+		RESOLV_CONF="search $DNS_SEARCH\n"
+	fi
+
+	for DNS_SERVER in $DNS_SERVERS; do
+		RESOLV_CONF="${RESOLV_CONF}nameserver $DNS_SERVER\n"
+	done
+
+	if printf '%b' "$RESOLV_CONF" |
+		podman_for_container exec -i "$CONTAINER" \
+			sh -c 'cat > /etc/resolv.conf'; then :; else
+		echo >&2 "$UTIL: Warning: DHCP lease acquired, but failed to update" \
+			"/etc/resolv.conf in CONTAINER=$CONTAINER"
+	fi
+}
+
+prefix_length_from_subnet() {
+	case "$1" in
+	255.255.255.255) echo 32 ;;
+	255.255.255.254) echo 31 ;;
+	255.255.255.252) echo 30 ;;
+	255.255.255.248) echo 29 ;;
+	255.255.255.240) echo 28 ;;
+	255.255.255.224) echo 27 ;;
+	255.255.255.192) echo 26 ;;
+	255.255.255.128) echo 25 ;;
+	255.255.255.0) echo 24 ;;
+	255.255.254.0) echo 23 ;;
+	255.255.252.0) echo 22 ;;
+	255.255.248.0) echo 21 ;;
+	255.255.240.0) echo 20 ;;
+	255.255.224.0) echo 19 ;;
+	255.255.192.0) echo 18 ;;
+	255.255.128.0) echo 17 ;;
+	255.255.0.0) echo 16 ;;
+	255.254.0.0) echo 15 ;;
+	255.252.0.0) echo 14 ;;
+	255.248.0.0) echo 13 ;;
+	255.240.0.0) echo 12 ;;
+	255.224.0.0) echo 11 ;;
+	255.192.0.0) echo 10 ;;
+	255.128.0.0) echo 9 ;;
+	255.0.0.0) echo 8 ;;
+	254.0.0.0) echo 7 ;;
+	252.0.0.0) echo 6 ;;
+	248.0.0.0) echo 5 ;;
+	240.0.0.0) echo 4 ;;
+	224.0.0.0) echo 3 ;;
+	192.0.0.0) echo 2 ;;
+	128.0.0.0) echo 1 ;;
+	0.0.0.0) echo 0 ;;
+	*)
+		echo >&2 "$UTIL: unsupported subnet mask: $1"
+		return 1
+		;;
+	esac
+}
+
+run_udhcpc_hook() {
+	REASON="$1"
+	PREFIX=32
+
+	case "$REASON" in
+	deconfig)
+		ip addr flush dev "$interface" scope global 2>/dev/null || true
+		ip route flush dev "$interface" 2>/dev/null || true
+		;;
+	bound | renew)
+		if [ -n "${subnet:-}" ]; then
+			PREFIX=$(prefix_length_from_subnet "$subnet")
+		elif [ -n "${mask:-}" ]; then
+			PREFIX="$mask"
+		fi
+
+		ip link set "$interface" up
+		ip addr flush dev "$interface" scope global 2>/dev/null || true
+		ip route flush dev "$interface" 2>/dev/null || true
+
+		if [ -n "${broadcast:-}" ]; then
+			ip addr add "$ip/$PREFIX" broadcast "$broadcast" dev "$interface"
+		else
+			ip addr add "$ip/$PREFIX" dev "$interface"
+		fi
+
+		for ROUTER in ${router:-}; do
+			ip route add default via "$ROUTER" dev "$interface" 2>/dev/null ||
+				ip route replace default via "$ROUTER" dev "$interface"
+		done
+
+		DNS_SEARCH=${search:-${domain:-}}
+		if [ -n "${OVS_PODMAN_CONTAINER:-}" ]; then
+			set_container_resolv_conf "$OVS_PODMAN_CONTAINER" "${dns:-}" \
+				"$DNS_SEARCH"
+		fi
+		;;
+	*) ;;
+	esac
+}
+
+configure_dhcp_interface() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+
+	if command -v busybox >/dev/null 2>&1 &&
+		busybox --list 2>/dev/null | grep -qx udhcpc; then
+		configure_dhcp_interface_with_udhcpc "$INTERFACE" "$CONTAINER"
+		return $?
+	fi
+
+	echo >&2 "$UTIL: Warning: busybox udhcpc not available, falling back" \
+		"to one-shot dhcpcd without automatic lease renewal"
+	configure_dhcp_interface_with_dhcpcd "$INTERFACE" "$CONTAINER"
+}
+
+wait_for_dhcp_ipv4_address() {
+	NETNS_PID="$1"
+	INTERFACE="$2"
+	PIDFILE="$3"
+	ATTEMPTS=0
+
+	while [ "$ATTEMPTS" -lt 150 ]; do
+		if ip netns exec "$NETNS_PID" \
+			ip -4 -o addr show dev "$INTERFACE" scope global |
+			grep -q ' inet '; then
+			return 0
+		fi
+
+		if [ -r "$PIDFILE" ]; then
+			UDHCPC_PID=$(cat "$PIDFILE" 2>/dev/null)
+			if [ -n "$UDHCPC_PID" ] &&
+				! kill -0 "$UDHCPC_PID" 2>/dev/null; then
+				return 1
+			fi
+		fi
+
+		sleep 0.2
+		ATTEMPTS=$((ATTEMPTS + 1))
+	done
+
+	return 1
+}
+
+configure_dhcp_interface_with_udhcpc() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+	STATE_DIR=$(get_dhcp_state_dir "$CONTAINER" "$INTERFACE")
+	PIDFILE="$STATE_DIR/udhcpc.pid"
+	LOGFILE="$STATE_DIR/udhcpc.log"
+
+	search_path busybox
+
+	mkdir -p "$DHCP_STATE_ROOT" "$STATE_DIR"
+	rm -f "$PIDFILE" "$LOGFILE"
+
+	if ip netns exec "$PID" env \
+		"OVS_PODMAN_CONTAINER=$CONTAINER" \
+		"OVS_PODMAN_UDHCPC_HOOK=1" \
+		"OVS_PODMAN_PODMAN_BIN=$(command -v podman)" \
+		"OVS_PODMAN_SUDO_USER=${SUDO_USER:-}" \
+		sh -c 'busybox setsid busybox udhcpc -f -S -n -R \
+			-i "$1" -s "$2" -p "$3" >"$4" 2>&1 &' \
+		sh "$INTERFACE" "$SCRIPT_PATH" "$PIDFILE" "$LOGFILE"; then :; else
+		echo >&2 "$UTIL: Failed to start a DHCP client for" \
+			"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+		return 1
+	fi
+
+	if wait_for_dhcp_ipv4_address "$PID" "$INTERFACE" "$PIDFILE"; then
+		return 0
+	fi
+
+	echo >&2 "$UTIL: Failed to acquire a DHCP lease for" \
+		"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE" \
+		"(see $LOGFILE)"
+	stop_dhcp_interface "$CONTAINER" "$INTERFACE"
+	return 1
+}
+
+configure_dhcp_interface_with_dhcpcd() {
+	INTERFACE="$1"
+	CONTAINER="$2"
+
+	search_path dhcpcd
+
+	if ip netns exec "$PID" dhcpcd -1 -4 --waitip=4 -L \
+		-C resolv.conf -C hostname "$INTERFACE"; then
+		DHCPCD_LEASE=$(ip netns exec "$PID" dhcpcd -U -4 "$INTERFACE" \
+			2>/dev/null)
+		if [ -n "$DHCPCD_LEASE" ]; then
+			set_container_resolv_conf_from_dhcp "$CONTAINER"
+		fi
+	else
+		echo >&2 "$UTIL: Failed to acquire a DHCP lease for" \
+			"CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		return 1
+	fi
+}
+
+add_port() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER="$3"
+	ADDRESS=""
+	MACADDRESS=""
+	GATEWAY=""
+	USE_DHCP=""
+	SRIOV_DEV=""
+	MTU=""
+	COMBINED=""
+	RING_RX=""
+	RING_TX=""
+	TSO=""
+	GSO=""
+	GRO=""
+	NO_OPTIMIZATION=""
+	HAS_OPTIMIZATION_OPTION=""
+
+	if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
+		echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
+		exit 1
+	fi
+
+	shift 3
+	while [ $# -ne 0 ]; do
+		case $1 in
+		--ipaddress=*)
+			ADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--macaddress=*)
+			MACADDRESS=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--gateway=*)
+			GATEWAY=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			shift
+			;;
+		--dhcp)
+			USE_DHCP=yes
+			shift
+			;;
+		--sriov)
+			if [ $# -lt 2 ] || [ -z "$2" ]; then
+				echo >&2 "$UTIL add-port: --sriov requires a netdev argument"
+				exit 1
+			fi
+			SRIOV_DEV="$2"
+			shift 2
+			;;
+		--sriov=*)
+			SRIOV_DEV=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			if [ -z "$SRIOV_DEV" ]; then
+				echo >&2 "$UTIL add-port: --sriov requires a netdev argument"
+				exit 1
+			fi
+			shift
+			;;
+		--mtu=*)
+			MTU=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --mtu
+			validate_positive_or_minus_one --mtu "$MTU"
+			shift
+			;;
+		--combined=*)
+			COMBINED=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --combined
+			validate_positive_or_minus_one --combined "$COMBINED"
+			shift
+			;;
+		--ring-rx=*)
+			RING_RX=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --ring-rx
+			validate_positive_or_minus_one --ring-rx "$RING_RX"
+			shift
+			;;
+		--ring-tx=*)
+			RING_TX=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --ring-tx
+			validate_positive_or_minus_one --ring-tx "$RING_TX"
+			shift
+			;;
+		--tso=*)
+			TSO=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --tso
+			validate_toggle_or_minus_one --tso "$TSO"
+			shift
+			;;
+		--gso=*)
+			GSO=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --gso
+			validate_toggle_or_minus_one --gso "$GSO"
+			shift
+			;;
+		--gro=*)
+			GRO=$(expr X"$1" : 'X[^=]*=\(.*\)')
+			mark_optimization_option_seen --gro
+			validate_toggle_or_minus_one --gro "$GRO"
+			shift
+			;;
+		--no-optimization)
+			if [ -n "$HAS_OPTIMIZATION_OPTION" ]; then
+				echo >&2 "$UTIL add-port: --no-optimization cannot be used" \
+					"together with individual optimization options"
+				exit 1
+			fi
+			NO_OPTIMIZATION=yes
+			disable_all_optimizations
+			shift
+			;;
+		*)
+			echo >&2 "$UTIL add-port: unknown option \"$1\""
+			exit 1
+			;;
+		esac
+	done
+
+	# Check if a port is already attached for the given container and interface.
+	PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+		2>/dev/null)
+	if [ -n "$PORT" ]; then
+		echo >&2 "$UTIL: Port already attached" \
+			"for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+		exit 1
+	fi
+
+	if [ -n "$USE_DHCP" ] && { [ -n "$ADDRESS" ] || [ -n "$GATEWAY" ]; }; then
+		echo >&2 "$UTIL add-port: --dhcp cannot be used together with" \
+			"--ipaddress or --gateway"
+		exit 1
+	fi
+
+	if ovs_vsctl br-exists "$BRIDGE" ||
+		ovs_vsctl add-br "$BRIDGE"; then :; else
+		echo >&2 "$UTIL: Failed to create bridge $BRIDGE"
+		exit 1
+	fi
+
+	if PID=$(get_container_pid "$CONTAINER"); then :; else
+		exit 1
+	fi
+
+	create_netns_link
+
+	if [ -n "$SRIOV_DEV" ]; then
+		add_sriov_port "$BRIDGE" "$INTERFACE" "$CONTAINER" "$SRIOV_DEV"
+		return $?
+	fi
+
+	# Create a veth pair.
+	ID=$(uuidgen | sed 's/-//g')
+	PORTNAME="${ID:0:13}"
+	ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+
+	# Add one end of veth to the OVS bridge.
+	if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
+		-- set interface "${PORTNAME}_l" \
+		external_ids:container_id="$CONTAINER" \
+		external_ids:container_iface="$INTERFACE"; then :; else
+		echo >&2 "$UTIL: Failed to add ${PORTNAME}_l port to bridge $BRIDGE"
+		ip link delete "${PORTNAME}_l"
+		exit 1
+	fi
+
+	ip link set "${PORTNAME}_l" up
+
+	# Move "${PORTNAME}_c" inside the container and change its name.
+	ip link set "${PORTNAME}_c" netns "$PID"
+	ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+	configure_container_interface "$INTERFACE" "$CONTAINER" "${PORTNAME}_l"
+}
+
+del_port() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER="$3"
+
+	if [ "$#" -lt 3 ]; then
+		usage
+		exit 1
+	fi
+
+	PORT=$(get_port_for_container_interface "$CONTAINER" "$INTERFACE")
+	if [ -z "$PORT" ]; then
+		exit 1
+	fi
+
+	delete_container_port "$PORT" "$CONTAINER" "$INTERFACE"
+}
+
+del_ports() {
+	BRIDGE="$1"
+	CONTAINER="$2"
+	if [ "$#" -lt 2 ]; then
+		usage
+		exit 1
+	fi
+
+	PORTS=$(ovs_vsctl --data=bare --no-heading --columns=name find interface \
+		external_ids:container_id="$CONTAINER")
+	if [ -z "$PORTS" ]; then
+		exit 0
+	fi
+
+	for PORT in $PORTS; do
+		CONTAINER_INTERFACE=$(ovs_vsctl --if-exists get interface "$PORT" \
+			external_ids:container_iface 2>/dev/null | tr -d '"')
+		if [ -n "$CONTAINER_INTERFACE" ] &&
+			[ "$CONTAINER_INTERFACE" != "[]" ]; then
+			delete_container_port "$PORT" "$CONTAINER" "$CONTAINER_INTERFACE" ||
+				return 1
+		else
+			ovs_vsctl --if-exists del-port "$PORT"
+			ip link delete "$PORT"
+		fi
+	done
+}
+
+set_vlan() {
+	BRIDGE="$1"
+	INTERFACE="$2"
+	CONTAINER_ID="$3"
+	VLAN="$4"
+
+	if [ "$#" -lt 4 ]; then
+		usage
+		exit 1
+	fi
+
+	PORT=$(get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE")
+	if [ -z "$PORT" ]; then
+		exit 1
+	fi
+	ovs_vsctl set port "$PORT" tag="$VLAN"
+}
+
+usage() {
+	cat <<EOF
+${UTIL}: Performs integration of Open vSwitch with Podman.
+usage: ${UTIL} COMMAND
+
+Commands:
+  add-port BRIDGE INTERFACE CONTAINER [--ipaddress="ADDRESS"]
+		                    [--gateway=GATEWAY] [--macaddress="MACADDRESS"]
+		                    [--mtu=MTU|-1] [--combined=N|-1]
+		                    [--ring-rx=N|-1] [--ring-tx=N|-1]
+		                    [--tso=on|off|-1] [--gso=on|off|-1]
+		                    [--gro=on|off|-1] [--no-optimization]
+		                    [--dhcp] [--sriov DEV]
+  del-port BRIDGE INTERFACE CONTAINER
+  del-ports BRIDGE CONTAINER
+  set-vlan BRIDGE INTERFACE CONTAINER VLAN
+Options:
+  -h, --help
+EOF
+}
+
+UTIL=$(basename "$0")
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
+if [ -z "$SCRIPT_PATH" ]; then
+	SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+DHCP_STATE_ROOT="/run/${UTIL}-dhcp"
+
+if [ -n "${OVS_PODMAN_UDHCPC_HOOK:-}" ]; then
+	run_udhcpc_hook "$@"
+	exit $?
+fi
+
+search_path ovs-vsctl
+search_path podman
+search_path nsenter
+search_path uuidgen
+if command_exists ethtool; then
+	HAVE_ETHTOOL=yes
+else
+	HAVE_ETHTOOL=no
+fi
+if command_exists nproc; then
+	NPROC_COUNT=$(nproc 2>/dev/null)
+else
+	NPROC_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+fi
+case "$NPROC_COUNT" in
+'' | *[!0-9]*)
+	NPROC_COUNT=""
+	;;
+esac
+
+if (ip netns) >/dev/null 2>&1; then :; else
+	echo >&2 "$UTIL: ip utility not found (or it does not support netns)," \
+		"cannot proceed"
+	exit 1
+fi
+
+if [ $# -eq 0 ]; then
+	usage
+	exit 0
+fi
+
+case $1 in
+"add-port")
+	shift
+	add_port "$@"
+	exit $?
+	;;
+"del-port")
+	shift
+	del_port "$@"
+	exit $?
+	;;
+"del-ports")
+	shift
+	del_ports "$@"
+	exit $?
+	;;
+"set-vlan")
+	shift
+	set_vlan "$@"
+	exit $?
+	;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	echo >&2 "$UTIL: unknown command \"$1\" (use --help for help)"
+	exit 1
+	;;
+esac

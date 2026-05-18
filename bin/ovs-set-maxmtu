@@ -1,0 +1,17 @@
+#!/bin/sh
+
+ovs_br="$1"
+
+# List all ports in the OVS bridge, query only existing devices for maxmtu,
+# and set the OVS bridge mtu to the lowest value.
+maxmtu_list=$(
+	ovs-vsctl list-ports "$ovs_br" | while IFS= read -r port; do
+		if ip link show dev "$port" >/dev/null 2>&1; then
+			ip -d link show "$port" | grep -oP 'maxmtu \K\d+'
+		fi
+	done
+)
+lowest_mtu=$(echo "$maxmtu_list" | sort -n | head -n 1)
+if [ -n "$lowest_mtu" ]; then
+	ovs-vsctl set Interface "$ovs_br" mtu_request="$lowest_mtu"
+fi

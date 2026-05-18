@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import apt, argparse, sys
+
+
+def is_sole_dependency(pkg_name, cache):
+    """
+    Check if pkg_name is the sole dependency (only alternative) in any
+    dependency group of any installed package.
+    """
+    for pkg in cache:
+        if not pkg.is_installed:
+            continue
+        deps = pkg.installed.get_dependencies("Depends", "Recommends", "Suggests")
+        for dep in deps:
+            names = {bd.name for bd in dep.or_dependencies}
+            # If this package is the only option in a dependency group, it's a sole dependency
+            if pkg_name in names and len(names) == 1:
+                return True
+    return False
+
+
+def extract_multi_dependencies(inst_ver):
+    """
+    Return a list of sorted multi-alternative dependency groups
+    (lists of names with len>1) for Depends, Recommends, Suggests.
+    """
+    deps = inst_ver.get_dependencies("Depends", "Recommends", "Suggests")
+    groups = []
+    for dep in deps:
+        names = {bd.name for bd in dep.or_dependencies}  # use a set to dedupe
+        if len(names) > 1:
+            groups.append(sorted(names))
+    return [sorted(grp) for grp in groups if len(grp) > 1]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find redundant dependencies in installed packages"
+    )
+    parser.add_argument(
+        "package",
+        nargs="?",
+        help="Package name to inspect (optional; if not provided, checks all installed packages)",
+    )
+    parser.add_argument(
+        "-s",
+        "--strict",
+        action="store_true",
+        help="Show only alternatives that are not sole dependencies of any other packages",
+    )
+    args = parser.parse_args()
+
+    cache = apt.Cache()
+    cache.open()
+
+    # Determine which packages to inspect
+    if args.package and cache.get(args.package) and cache[args.package].is_installed:
+        pkgs = [cache[args.package]]
+    else:
+        pkgs = [pkg for pkg in cache if pkg.is_installed]
+
+    for pkg in pkgs:
+        multi = extract_multi_dependencies(pkg.installed)
+        # Skip packages without any multi-alternative deps
+        if not multi:
+            continue
+
+        # Collect only those groups where >=2 alternatives are installed
+        installed_groups = []
+        for grp in multi:
+            installed = [
+                name for name in grp if cache.get(name) and cache[name].is_installed
+            ]
+            # In strict mode, filter out packages that are sole dependencies
+            if args.strict:
+                installed = [
+                    name for name in installed if not is_sole_dependency(name, cache)
+                ]
+            # Only add groups that still have 2+ alternatives after any filtering
+            if len(installed) >= 2:
+                installed_groups.append(installed)
+
+        # If none of the groups has 2+ installed, skip the package
+        if not installed_groups:
+            continue
+
+        # Print package header and each Installed line
+        print(f"Package: {pkg.name}")
+        for inst in installed_groups:
+            print("  Installed: " + " | ".join(inst))
+        print()
+
+
+if __name__ == "__main__":
+    main()
