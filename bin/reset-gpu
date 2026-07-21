@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly AMD_VENDOR_ID="0x1002"
+readonly NVIDIA_VENDOR_ID="0x10de"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  reset-gpu [--bus] <PCIe address>
+
+Identify and reset an AMD or NVIDIA GPU by its PCI address.
+
+Default behavior:
+  AMD       Driver-managed GPU recovery through amdgpu_gpu_recover
+  NVIDIA    Driver-managed FLR through nvidia-smi
+
+Argument:
+  <PCIe address>  A PCI address in 0000:03:00.0 or 03:00.0 format
+
+Options:
+  --bus        Use a bus reset instead of the vendor's default reset
+  -h, --help   Show this help message
+
+Examples:
+  sudo "$HOME/Projects/Utilities/bin/reset-gpu" 0000:7b:00.0
+  sudo "$HOME/Projects/Utilities/bin/reset-gpu" 03:00.0
+  sudo "$HOME/Projects/Utilities/bin/reset-gpu" --bus 03:00.0
+
+This tool does not invoke sudo internally and must be run as root.
+A bus reset may affect other PCI devices below the GPU's upstream bridge.
+Before an NVIDIA reset, every process using any NVIDIA device is terminated.
+The lactd, nvidia-persistenced, and nvidia-powerd services are also stopped.
+Owning user services and application scopes are stopped to prevent respawning.
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+reset_amd() {
+    local driver_name="none"
+    local recovery_file="/sys/kernel/debug/dri/$pci_address/amdgpu_gpu_recover"
+
+    if [[ -L "$device_path/driver" ]]; then
+        driver_name="$(basename -- "$(readlink -f -- "$device_path/driver")")"
+    fi
+
+    [[ "$driver_name" == "amdgpu" ]] || {
+        die "AMD GPU $pci_address is not bound to the amdgpu driver (driver: $driver_name)."
+    }
+    [[ -r "$recovery_file" ]] || {
+        die "cannot read the amdgpu GPU recovery interface: $recovery_file"
+    }
+
+    printf 'Running amdgpu driver-managed recovery on AMD GPU %s.\n' "$pci_address"
+    if ! cat "$recovery_file" >/dev/null; then
+        die "amdgpu GPU recovery failed."
+    fi
+    printf 'Reset complete: %s (amdgpu_gpu_recover)\n' "$pci_address"
+}
+
+ensure_nvidia_modules_live() {
+    local module_name
+    local module_state
+    local nvidia_module_seen=false
+
+    while read -r module_name _ _ _ module_state _; do
+        if [[ "$module_name" == "nvidia" || "$module_name" == nvidia_* ]]; then
+            nvidia_module_seen=true
+            if [[ "$module_state" != "Live" ]]; then
+                die "NVIDIA module $module_name is $module_state; reboot before attempting another reset."
+            fi
+        fi
+    done </proc/modules
+
+    [[ "$nvidia_module_seen" == true ]] || die "no NVIDIA kernel module is loaded."
+}
+
+stop_nvidia_client_units() {
+    local cgroup_path
+    local holder_pid
+    local systemctl_path
+    local unit
+    local unit_key
+    local user_bus
+    local user_name
+    local user_runtime_dir
+    local user_uid
+    local -a holder_pids
+    local -A seen_pids=()
+    local -A seen_units=()
+
+    systemctl_path="$(command -v systemctl)" || die "systemctl is not installed or not in PATH."
+
+    while read -r -a holder_pids; do
+        for holder_pid in "${holder_pids[@]}"; do
+            holder_pid="${holder_pid//[^0-9]/}"
+            [[ -n "$holder_pid" ]] || continue
+            [[ -z "${seen_pids[$holder_pid]+present}" ]] || continue
+            seen_pids["$holder_pid"]=true
+
+            [[ -r "/proc/$holder_pid/cgroup" ]] || continue
+            cgroup_path="$(sed -n 's/^0:://p' "/proc/$holder_pid/cgroup")"
+            [[ -n "$cgroup_path" ]] || continue
+            unit="${cgroup_path##*/}"
+
+            case "$unit" in
+                *.service | app-*.scope) ;;
+                *) continue ;;
+            esac
+
+            user_uid="$(stat -c %u "/proc/$holder_pid" 2>/dev/null || true)"
+            [[ -n "$user_uid" ]] || continue
+            unit_key="$user_uid:$unit"
+            [[ -z "${seen_units[$unit_key]+present}" ]] || continue
+            seen_units["$unit_key"]=true
+
+            if [[ "$cgroup_path" == *"/user@$user_uid.service/"* ]]; then
+                user_name="$(id -nu "$user_uid" 2>/dev/null || true)"
+                user_runtime_dir="/run/user/$user_uid"
+                user_bus="$user_runtime_dir/bus"
+                if [[ -n "$user_name" && -S "$user_bus" ]] && command -v runuser >/dev/null 2>&1; then
+                    printf 'Stopping user unit %s for UID %s.\n' "$unit" "$user_uid"
+                    runuser -u "$user_name" -- env \
+                        XDG_RUNTIME_DIR="$user_runtime_dir" \
+                        DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
+                        "$systemctl_path" --user stop --no-block "$unit" || {
+                        printf 'Warning: failed to stop user unit %s.\n' "$unit" >&2
+                    }
+                fi
+            else
+                printf 'Stopping system unit %s.\n' "$unit"
+                "$systemctl_path" stop --no-block "$unit" || {
+                    printf 'Warning: failed to stop system unit %s.\n' "$unit" >&2
+                }
+            fi
+        done
+    done < <({ fuser "$@" 2>/dev/null || true; printf '\n'; })
+}
+
+drain_nvidia_clients() {
+    local drm_node
+    local drm_path
+    local node
+    local service
+    local -a nvidia_nodes=()
+    local -a nvidia_services=(
+        lactd.service
+        nvidia-persistenced.service
+        nvidia-powerd.service
+    )
+
+    command -v fuser >/dev/null 2>&1 || die "fuser is not installed or not in PATH."
+
+    for node in /dev/nvidia*; do
+        [[ -e "$node" ]] && nvidia_nodes+=("$node")
+    done
+
+    for drm_path in /sys/class/drm/card[0-9]* /sys/class/drm/renderD*; do
+        [[ -r "$drm_path/device/vendor" ]] || continue
+        [[ "$(<"$drm_path/device/vendor")" == "$NVIDIA_VENDOR_ID" ]] || continue
+        drm_node="/dev/dri/$(basename -- "$drm_path")"
+        [[ -e "$drm_node" ]] && nvidia_nodes+=("$drm_node")
+    done
+
+    ((${#nvidia_nodes[@]} > 0)) || die "no NVIDIA device nodes were found."
+
+    printf 'Stopping NVIDIA management and monitoring services.\n'
+    for service in "${nvidia_services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            systemctl stop --no-block "$service" || {
+                printf 'Warning: failed to request stop for %s.\n' "$service" >&2
+            }
+        fi
+    done
+
+    sleep 2
+    stop_nvidia_client_units "${nvidia_nodes[@]}"
+    sleep 2
+
+    if fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+        printf 'NVIDIA device clients before termination:\n' >&2
+        fuser -v "${nvidia_nodes[@]}" >&2 || true
+        printf 'Sending SIGTERM to all NVIDIA device clients.\n' >&2
+        fuser -k -TERM "${nvidia_nodes[@]}" >/dev/null 2>&1 || true
+    fi
+
+    for _ in 1 2 3 4 5; do
+        if ! fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    if fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+        stop_nvidia_client_units "${nvidia_nodes[@]}"
+        sleep 1
+        printf 'NVIDIA device clients still present after SIGTERM:\n' >&2
+        fuser -v "${nvidia_nodes[@]}" >&2 || true
+        printf 'Sending SIGKILL to the remaining NVIDIA device clients.\n' >&2
+        fuser -k -KILL "${nvidia_nodes[@]}" >/dev/null 2>&1 || true
+    fi
+
+    for _ in 1 2 3; do
+        if ! fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    if fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+        stop_nvidia_client_units "${nvidia_nodes[@]}"
+        sleep 1
+    fi
+
+    if fuser -s "${nvidia_nodes[@]}" 2>/dev/null; then
+        printf 'NVIDIA device clients that could not be terminated:\n' >&2
+        fuser -v "${nvidia_nodes[@]}" >&2 || true
+        die "one or more NVIDIA device clients are still active."
+    fi
+
+    printf 'All NVIDIA device clients have been terminated.\n'
+}
+
+reset_nvidia() {
+    command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is not installed or not in PATH."
+
+    ensure_nvidia_modules_live
+    drain_nvidia_clients
+    ensure_nvidia_modules_live
+
+    if [[ "$use_bus_reset" == true ]]; then
+        printf 'Running an nvidia-smi bus reset on NVIDIA GPU %s.\n' "$pci_address"
+        if ! nvidia-smi -r bus -i "$pci_address"; then
+            die "NVIDIA GPU bus reset failed."
+        fi
+        printf 'Reset complete: %s (nvidia-smi bus reset)\n' "$pci_address"
+    else
+        printf 'Running an nvidia-smi FLR on NVIDIA GPU %s.\n' "$pci_address"
+        if ! nvidia-smi --gpu-reset -i "$pci_address"; then
+            die "NVIDIA GPU FLR failed."
+        fi
+        printf 'Reset complete: %s (nvidia-smi FLR)\n' "$pci_address"
+    fi
+}
+
+reset_amd_bus() {
+    local device_real_path
+    local bridge_path
+    local bridge_address
+    local bridge_class
+    local bus_reset_file
+
+    device_real_path="$(readlink -f -- "$device_path")"
+    bridge_path="$(dirname -- "$device_real_path")"
+    bridge_address="$(basename -- "$bridge_path")"
+
+    [[ -r "$bridge_path/class" ]] || die "cannot read the upstream PCIe bridge information."
+    bridge_class="$(<"$bridge_path/class")"
+    bridge_class="${bridge_class,,}"
+    [[ "$bridge_class" == 0x0604* ]] || {
+        die "cannot identify the upstream PCIe bridge for $pci_address."
+    }
+
+    bus_reset_file="$bridge_path/reset_subordinate"
+    [[ -w "$bus_reset_file" ]] || {
+        die "the kernel or upstream bridge does not support subordinate bus reset: $bridge_address"
+    }
+
+    printf 'Warning: bus reset affects every PCI device below bridge %s.\n' \
+        "$bridge_address" >&2
+    printf 'Running bus reset on AMD GPU %s.\n' "$pci_address"
+
+    if ! printf '1' >"$bus_reset_file"; then
+        die "subordinate bus reset failed on bridge $bridge_address."
+    fi
+    printf 'Reset complete: %s (bus, bridge %s)\n' "$pci_address" "$bridge_address"
+}
+
+use_bus_reset=false
+pci_address=""
+
+while (($# > 0)); do
+    case "$1" in
+        --bus)
+            use_bus_reset=true
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            if (($# > 0)); then
+                [[ -z "$pci_address" ]] || die "only one PCIe address may be specified."
+                pci_address="$1"
+                shift
+                (($# == 0)) || die "only one PCIe address may be specified."
+            fi
+            break
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            [[ -z "$pci_address" ]] || die "only one PCIe address may be specified."
+            pci_address="$1"
+            ;;
+    esac
+    shift
+done
+
+[[ -n "$pci_address" ]] || {
+    usage >&2
+    exit 2
+}
+
+pci_address="${pci_address,,}"
+if [[ "$pci_address" =~ ^[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]]; then
+    pci_address="0000:$pci_address"
+elif [[ ! "$pci_address" =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]]; then
+    die "invalid PCIe address: $pci_address"
+fi
+
+device_path="/sys/bus/pci/devices/$pci_address"
+[[ -d "$device_path" ]] || die "PCI device not found: $pci_address"
+[[ -r "$device_path/vendor" ]] || die "cannot read the PCI vendor information."
+[[ -r "$device_path/class" ]] || die "cannot read the PCI class information."
+
+vendor_id="$(<"$device_path/vendor")"
+device_class="$(<"$device_path/class")"
+vendor_id="${vendor_id,,}"
+device_class="${device_class,,}"
+
+[[ "$device_class" == 0x03* ]] || {
+    die "$pci_address is not a GPU/display controller (class: $device_class)."
+}
+
+case "$vendor_id" in
+    "$AMD_VENDOR_ID")
+        vendor="amd"
+        ;;
+    "$NVIDIA_VENDOR_ID")
+        vendor="nvidia"
+        ;;
+    *)
+        die "$pci_address is not a supported AMD/NVIDIA GPU (vendor ID: $vendor_id)."
+        ;;
+esac
+
+((EUID == 0)) || die "root privileges are required; run this script itself with sudo."
+
+if [[ "$vendor" == "nvidia" ]]; then
+    reset_nvidia
+elif [[ "$use_bus_reset" == true ]]; then
+    reset_amd_bus
+else
+    reset_amd
+fi

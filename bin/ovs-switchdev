@@ -1,0 +1,89 @@
+#!/bin/sh
+set -ex
+
+if [ "$#" -ne 4 ] && [ "$#" -ne 5 ]; then
+	echo >&2 "usage: $0 OVS_BR NETDEV NUMVFS MAXMTU [--doca]"
+	exit 1
+fi
+
+ovs_br="$1"
+netdev="$2"
+numvfs="$3"
+maxmtu="$4"
+use_doca=false
+
+if [ "$#" -eq 5 ]; then
+	if [ "$5" != "--doca" ]; then
+		echo >&2 "usage: $0 OVS_BR NETDEV NUMVFS MAXMTU [--doca]"
+		exit 1
+	fi
+	use_doca=true
+fi
+
+parsed="${netdev%np*}"
+
+ovs-vsctl --no-wait set Open_vSwitch . other_config:hw-offload=true
+
+if [ "$use_doca" = true ]; then
+	ovs-vsctl --no-wait set Open_vSwitch . other_config:doca-init=true
+	ovs-vsctl --no-wait set Open_vSwitch . other_config:pmd-sleep-max=10
+	ovs-vsctl --no-wait set Bridge "$ovs_br" datapath_type=doca
+else
+	ovs-vsctl --no-wait set Bridge "$ovs_br" datapath_type=system
+fi
+
+ovs-vsctl --no-wait list-ports "$ovs_br" | grep "$parsed" | \
+	xargs -r -I {} ovs-vsctl --no-wait del-port "$ovs_br" {}
+
+ip link set "$netdev" down
+
+pciaddr=$(ethtool -i "$netdev" | grep bus-info | awk '{print $2}')
+
+echo 0 | tee /sys/bus/pci/devices/"$pciaddr"/sriov_numvfs >/dev/null
+
+devlink dev eswitch set pci/"$pciaddr" mode legacy
+echo dmfs > /sys/class/net/"$netdev"/compat/devlink/steering_mode
+devlink dev eswitch set pci/"$pciaddr" mode switchdev
+
+ethtool -L "$netdev" combined "$(nproc)"
+# Grep only the first line
+rx_size=$(ethtool -g "$netdev" | grep -m 1 'RX:' | awk '{print $2}')
+tx_size=$(ethtool -g "$netdev" | grep -m 1 'TX:' | awk '{print $2}')
+ethtool -G "$netdev" rx "$rx_size" tx "$tx_size"
+
+echo "$numvfs" | tee /sys/bus/pci/devices/"$pciaddr"/sriov_numvfs >/dev/null
+
+if [ "$use_doca" = true ]; then
+	ovs-vsctl --no-wait add-port "$ovs_br" "$netdev" -- \
+		set Interface "$netdev" type=doca mtu_request="$maxmtu"
+else
+	ovs-vsctl --no-wait add-port "$ovs_br" "$netdev"
+fi
+
+ethtool -K "$netdev" tso on gso on gro on lro on
+ip link set "$netdev" mtu "$maxmtu"
+ip link set "$netdev" up
+
+i=0
+while [ "$i" -lt "$numvfs" ]; do
+	target_dev="${parsed}r${i}"
+	ethtool -L "$target_dev" combined "$(nproc)"
+	rx_size=$(ethtool -g "$target_dev" | grep -m 1 'RX:' | awk '{print $2}')
+	tx_size=$(ethtool -g "$target_dev" | grep -m 1 'TX:' | awk '{print $2}')
+	ethtool -G "$target_dev" rx "$rx_size" tx "$tx_size"
+	ethtool -K "$target_dev" tso on gso on gro on lro on
+	if [ "$use_doca" = true ]; then
+		ovs-vsctl --no-wait add-port "$ovs_br" "$target_dev" -- \
+			set Interface "$target_dev" type=doca mtu_request="$maxmtu"
+	else
+		ovs-vsctl --no-wait add-port "$ovs_br" "$target_dev"
+	fi
+	ip link set "$target_dev" mtu "$maxmtu"
+	ip link set "$target_dev" up
+	i=$((i + 1))
+done
+
+# Persist the bridge-local MTU so ovs-vswitchd reapplies it after restarts.
+ovs-vsctl --no-wait set Interface "$ovs_br" mtu_request="$maxmtu"
+
+tc qdisc replace dev "$netdev" root fq_codel # Make DHCP work

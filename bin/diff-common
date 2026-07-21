@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+d1="$1"
+d2="$2"
+
+# Find common files (same relative paths)
+LC_ALL=C comm -z -12 \
+	<(cd -P -- "$d1" && find . -type f -print0 | LC_ALL=C sort -z) \
+	<(cd -P -- "$d2" && find . -type f -print0 | LC_ALL=C sort -z) |
+	while IFS= read -rd '' rel; do
+		# Strip leading './'
+		rel="${rel#./}"
+		f1="$d1/$rel"
+		f2="$d2/$rel"
+
+		# Compare content silently
+		if ! cmp -s -- "$f1" "$f2"; then
+			printf "DIFFERS: %s\n" "$rel"
+		fi
+	done

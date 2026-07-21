@@ -1,0 +1,9 @@
+#!/bin/sh
+wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+STATE=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ | grep -o '\[MUTED\]')
+
+if [ "$STATE" = "[MUTED]" ]; then
+	notify-send -h string:x-canonical-private-synchronous:toggle-audio -t 5000 "wpctl" "@DEFAULT_AUDIO_SINK@ MUTED"
+else
+	notify-send -h string:x-canonical-private-synchronous:toggle-audio -t 5000 "wpctl" "@DEFAULT_AUDIO_SINK@ UNMUTED"
+fi
